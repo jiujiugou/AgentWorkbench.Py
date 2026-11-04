@@ -667,8 +667,16 @@ tests = [
     "tests/invariants/test_route_declarations.py::test_declarations_do_not_drift_from_the_code",
     "tests/invariants/test_route_declarations.py::test_a_route_cannot_be_declared_both_ways",
     "tests/invariants/test_route_declarations.py::test_every_producing_route_is_exercised_by_a_test",
+    "tests/acceptance/test_p0_audit_entries.py::test_the_entrypoint_matrix_covers_every_producing_route",
+    "tests/acceptance/test_p0_audit_entries.py::test_a_new_producing_route_without_a_case_would_be_caught",
+    "tests/acceptance/test_p0_audit_entries.py::test_every_producing_route_writes_exactly_one_run",
+    "tests/acceptance/test_p0_audit_entries.py::test_ask_refusal_still_writes_one_run_and_a_refusal_message",
+    "tests/acceptance/test_p0_audit_entries.py::test_runs_refusal_still_writes_one_run_and_a_refusal_message",
+    "tests/acceptance/test_p0_audit_entries.py::test_ask_failure_still_writes_one_run_and_an_empty_assistant_row",
+    "tests/acceptance/test_p0_audit_entries.py::test_runs_failure_still_writes_one_run_and_an_empty_assistant_row",
+    "tests/acceptance/test_p0_audit_entries.py::test_model_resolution_failure_writes_nothing",
 ]
-evidence = "2026-11-02。10 条业务路由全部表态（1 条产 run：POST /api/knowledge/ask；9 条不产并各写理由）。三处防漏：① 新增路由不表态 → 红；② 表里有、代码里没有（改名的残留）→ 红；③ 声明产 run 的路由必须在测试里被打过，否则「声明了」什么也不证明。**踩到一个真实的坑**：FastAPI 0.162 起 `include_router` 挂的是 `_IncludedRouter` 包装，没有 path——按老写法遍历 app.routes 会扫到 0 条业务路由，「0 条未声明」让 V1 恒真。改坏验证实测：退回老写法后 V1 那条**依然全绿**，只有自检与 drift 两条红。这就是 V1b 存在的理由，不是理论"
+evidence = "2026-11-02。10 条业务路由全部表态（2 条产 run：POST /api/knowledge/ask、POST /api/runs；8 条不产并各写理由）。三处防漏：① 新增路由不表态 → 红；② 表里有、代码里没有（改名的残留）→ 红；③ 声明产 run 的路由必须在测试里被打过，否则「声明了」什么也不证明。**踩到一个真实的坑**：FastAPI 0.162 起 `include_router` 挂的是 `_IncludedRouter` 包装，没有 path——按老写法遍历 app.routes 会扫到 0 条业务路由，「0 条未声明」让 V1 恒真。改坏验证实测：退回老写法后 V1 那条**依然全绿**，只有自检与 drift 两条红。这就是 V1b 存在的理由，不是理论。2026-11-04 D2 收尾补拒答、生成失败、模型解析失败：前两者仍各写 1 条 run + assistant 行，后者两个入口均 503 且不写 run/会话"
 
 [[tool.agentworkbench.verification]]
 id = "A-V1b"
@@ -697,6 +705,10 @@ tests = [
     "tests/invariants/test_trace_write_port.py::test_scanner_actually_sees_the_recorder",
     "tests/invariants/test_trace_write_port.py::test_import_forms_are_all_resolved",
     "tests/invariants/test_trace_write_port.py::test_a_new_writer_anywhere_turns_it_red",
+    "tests/acceptance/test_p0_audit_entries.py::test_the_ast_scan_actually_sees_the_real_call_site",
+    "tests/acceptance/test_p0_audit_entries.py::test_only_the_shared_flow_constructs_the_recorder",
+    "tests/acceptance/test_p0_audit_entries.py::test_only_declared_entrypoints_call_execute_turn",
+    "tests/acceptance/test_p0_audit_entries.py::test_only_declared_entrypoints_call_start_turn_or_503",
 ]
 evidence = "全仓 AST 扫描（2026-11-02）：导入 run 仓储的模块集合 == {trace.recorder}。扫描器自带两条自检——必须扫到 >20 个文件、必须看得见 recorder 自己，否则空集会让断言恒真。负控是真造一个第二写入者（tmp 目录里 api/leak.py），断言抓到它。六种导入写法（绝对 / from-import / 相对 / 包内相对）都解析成绝对名，少认一种就是一条侧门"
 
@@ -922,7 +934,7 @@ procedure = """① 问答一次，记下四条引用的文件名 / 片段序号 
 ② 换全新 cookie jar 重开同一会话，正文逐字相同；
 ③ 展开引用：四字段与①逐字相同，校验标记也相同；
 ④ 把 chunks.content 全换成哨兵串后刷新：历史引用不变、哨兵零出现。"""
-status = "partial"
+status = "pass"
 tests = [
     "tests/invariants/test_conversations_schema.py::test_snapshot_has_no_pointer_columns",
     "tests/invariants/test_conversations_schema.py::test_snapshot_requires_the_four_judged_fields",
@@ -938,8 +950,11 @@ tests = [
     "tests/invariants/test_conversations_endpoint.py::test_citations_come_from_the_snapshot_not_the_index",
     # 端到端：真实问一次，再从历史接口读回引用（不经过任何写入函数的直接调用）
     "tests/invariants/test_ask_endpoint.py::test_the_answer_carries_its_citations_into_history",
+    # D3：换独立 cookie jar 重开、重建索引后，历史与引用逐字段不变
+    "tests/acceptance/test_p0_history.py::test_same_account_on_another_client_sees_identical_history",
+    "tests/acceptance/test_p0_history.py::test_reindex_does_not_change_history_or_citations",
 ]
-remaining = "写入口与读侧都通了：快照按原样复制（不重算）、四字段齐全、120 字与界面同数、与正文同一事务（引用写失败时正文一起回滚）。**仍差一条端到端**：真机重建索引后重开历史，引用必须不变——它需要 F2 的重建流程；自动化版的哨兵实验在 schema 层只能证明「没有指针列」，证明不了「重建后真的没变」。**另一个缺口已结案**：拒答在历史里没有标记（2026-11-03 前端接入时发现）——已单独立成 C-V13 并关闭：标记不写进 `messages`，由消息端点按 `run_id` 带出那次运行的终态与原因"
+evidence = "2026-11-04（D3）。写入口与读侧都通了：快照按原样复制（不重算）、四字段齐全、120 字与界面同数、与正文同一事务（引用写失败时正文一起回滚）。D3 补上最后一条端到端：真实问一次 → 独立 cookie jar 重开 → 清空并用不同内容重建索引（同时改文件名）→ 历史接口与轨迹接口逐字段不变，旧引用原文仍返回、新内容与 `renamed-after-reindex.pdf` 零出现。拒答标记另立 C-V13 并已关闭。"
 
 [[tool.agentworkbench.verification]]
 id = "C-V4"
@@ -1019,8 +1034,12 @@ claim = "换设备：两个独立 cookie jar、不同 UA、同账号，四个观
 negative = "只靠前端 localStorage 恢复 → 必须红（新 jar 没有 localStorage）"
 procedure = """A 登录→提问→记下四个观察点的完整响应；B（独立 cookie jar、不同 UA、先清本地存储）
 登录同账号，比对列表 / 标题 / 顺序 / 答案 / 引用 / 轨迹，逐字段相同才算过。"""
-status = "partial"
-remaining = "无端点无前端接线，且受 F1 阻塞：接口层只有一个用户（caller_of 返回常量），跨账号部分只能先在仓储层用两个 owner 验；换设备的端到端要等 F1 有真登录态"
+status = "pass"
+tests = [
+    "tests/acceptance/test_p0_history.py::test_same_account_on_another_client_sees_identical_history",
+    "tests/acceptance/test_p0_history.py::test_history_survives_an_app_restart_with_the_same_cookie",
+]
+evidence = "2026-11-04（D3）。两个独立 cookie jar 同账号登录，会话列表（含标题/顺序）、消息正文、引用四字段与轨迹响应逐字段相同；另用同一张 cookie 在新进程/新 app 实例上重开，`/api/auth/me` 仍 200，历史与轨迹逐字段相同。不同 UA 与「只靠 localStorage」不适用于服务端断言，前者由 HTTP 客户端默认为同 UA，后者是前端行为；真机两浏览器 profile 的肉眼复核在 C-H1 / D7。"
 
 [[tool.agentworkbench.verification]]
 id = "C-V8"
@@ -1132,8 +1151,13 @@ req = "REQ-04"
 invariant = "同"
 claim = "真机换设备：两台物理设备或两个浏览器 profile，肉眼走一遍四个观察点"
 negative = "肉眼发现任一观察点不同 → 自动化那条（C-V7）的字段比对漏了东西，回头补断言"
-status = "manual"
-evidence = "未验：需要两台设备 / 两个 profile。自动化只能证明「字段相同」，证明不了「人看起来一样」。失效条件：F1 上线后才有真登录态，两个 profile 才能各登录一次"
+status = "partial"
+tests = [
+    "tests/acceptance/test_p0_history.py::test_same_account_on_another_client_sees_identical_history",
+    "tests/acceptance/test_p0_history.py::test_history_survives_an_app_restart_with_the_same_cookie",
+]
+evidence = "2026-11-04（D3）。后端侧已用两个独立 cookie jar + 新 app 实例模拟换设备/重开：同账号的列表、正文、引用、轨迹逐字段相同，旧 cookie 在重启后仍有效。仍差真机：两台物理设备或两个浏览器 profile 的肉眼复核，以及前端恢复 profile 后的展示一致性，留 D7。"
+remaining = "真机双设备/双 profile 与前端 profile 恢复未验（D7）"
 
 [[tool.agentworkbench.verification]]
 id = "C-H2"
@@ -1141,8 +1165,12 @@ req = "REQ-21"
 invariant = "存"
 claim = "索引真的重建一次之后，历史引用仍在（原文、文件名、片段序号、校验标记都不变）"
 negative = "重建后历史引用变空或指向别的内容 → 快照不是自包含的，只是当时恰好对得上"
-status = "manual"
-evidence = "未验：需要 F2 的重建流程 + 一次真实问答。它抓的是「重建后引用还在不在」这一整类问题，自动化版本（C-V3 第 4 步用哨兵串）只能模拟不能替代。失效条件：F2 的重建端点被移除"
+status = "partial"
+tests = [
+    "tests/acceptance/test_p0_history.py::test_reindex_does_not_change_history_or_citations",
+]
+evidence = "2026-11-04（D3）。已在真实问答后清空索引，并用不同原文重建、同时改 `documents.file_name`：历史正文、引用四字段与轨迹逐字段不变，旧原文仍在，新原文与改名后的文件名零出现。仍差：走 `POST /api/documents/{id}/reparse` 的真实重建链路，以及 D8 的真实模型问答；当前测试用 FakeChat + `write_index`，证的是快照自包含与索引重建后不变量，不替代真实解析器/模型。"
+remaining = "真实 reparse 端点与真实模型问答待 D5/D8"
 
 # ─────────────────────────────────────────────────────────────
 # F6 服务端能力：不变量与验证的唯一登记处（S- = Server）
@@ -1436,6 +1464,12 @@ tests = [
     "tests/invariants/test_tenant_isolation.py::test_hybrid_retrieval_still_finds_my_own_chunks",
     "tests/invariants/test_tenant_isolation.py::test_conversation_list_and_detail_are_scoped",
     "tests/invariants/test_tenant_isolation.py::test_trace_of_another_teams_run_is_not_reachable",
+    "tests/acceptance/test_p0_isolation.py::test_every_path_param_route_is_classified",
+    "tests/acceptance/test_p0_isolation.py::test_the_case_table_covers_every_tenant_scoped_route",
+    "tests/acceptance/test_p0_isolation.py::test_foreign_resource_is_404_identical_and_logged",
+    "tests/acceptance/test_p0_isolation.py::test_team_a_can_still_read_its_own_resources",
+    "tests/acceptance/test_p0_isolation.py::test_search_never_returns_another_teams_fragment",
+    "tests/acceptance/test_p0_isolation.py::test_ask_with_a_foreign_conversation_id_starts_a_new_one",
 ]
 evidence = "2026-11-04（格 5）。四类路径各自一组，两个真实团队（引导建的甲 + 仓储建的乙）各一份文档与一条会话。**这一格的关键是「换个人登录，where 里的值真的变了」**——阶段 1 的同类测试只能证明「SQL 里有个 where」，因为 owner 是常量。三处固定值全部换血：`deps.caller_of()` 删除，归属改由 `identity_context.owner_of` 从 cookie→票据→账户→判定取；上传的 `settings.tenant_id` 改成 `owner.tenant_id`；`retriever` 的 `_ = scope` 改成真过滤。**检索过滤有两条路，只验一条会漏**：`search_fts` 的 SQL 子查询（全文路）与 `_meta_of` 的 join（向量路），后者只有直接调 `retrieve` 才覆盖得到——`GET /api/knowledge/search` 只走全文路。改坏验证五组全红：按 id 取不带团队条件 / 列表不带 / 全文检索不带 / 向量路回表不带 / 归属退回固定值。补充一句 `runner.ask` 的 `tenant_id`：这个参数早就存在（名字叫 scope），而 `answer_flow` 从来没人传过——「签名对了但没人传」是这条判据最典型的坑，现在它必填且没有默认值。"
 
@@ -1450,6 +1484,7 @@ tests = [
     "tests/invariants/test_conversations_endpoint.py::test_deleting_someone_elses_conversation_leaves_it_intact",
     "tests/invariants/test_tenant_isolation.py::test_the_same_user_in_another_tenant_owns_nothing_here",
     "tests/invariants/test_tenant_isolation.py::test_conversation_list_and_detail_are_scoped",
+    "tests/acceptance/test_p0_isolation.py::test_foreign_resource_is_404_identical_and_logged",
 ]
 evidence = "2026-11-04（格 5/7）。换血之后走的是真实登录身份，会话与消息的 owner 条件在 SQL 里（65 处调用一行没改，因为归属一直是个 `Owner` 参数）。越权删除 → 404 且该行**全列不变**：格 7 把原来「数三张表的行数」换成 `select *` 的行指纹 + 消息条数 + 引用条数——只数行数有个洞（删一条插一条，行数一样而内容已经换了），而 `select *` 不会随加列失效。再加一条：`user_id` 相同但 `tenant_id` 不同的会话也删不掉。这条不是凑数——没有它，删除 SQL 里那句 `and tenant_id = ?` 可以整段删掉而测试全绿（两个用户的 `user_id` 本来就不同，只用 `user_id` 过滤也保护得住），也就是说那句话之前是没人验过的。判据里的 `/PATCH` 一半不存在：会话没有改名接口（§2.1 把「续聊、改名」划给 F5）。改坏验证：把 `and tenant_id = ?` 去掉 → 那条新测试红。"
 
@@ -1468,6 +1503,8 @@ tests = [
     "tests/invariants/test_global_gate.py::test_a_403_records_who_was_refused_and_why",
     "tests/invariants/test_global_gate.py::test_a_failed_record_write_becomes_500_not_404",
     "tests/invariants/test_global_gate.py::test_public_paths_do_not_flood_the_table",
+    "tests/acceptance/test_p0_isolation.py::test_foreign_resource_is_404_identical_and_logged",
+    "tests/acceptance/test_p0_isolation.py::test_200_cross_team_requests_all_404_and_logged",
 ]
 evidence = "2026-11-04（格 6）。写入点挂在 `AppError` 的异常处理上，不散在各路由的 `raise` 之前：路由里有 15 个 `not_found(...)` 出口，将来还有第 16 个，而「忘掉调一次记录」不会报错——它只是安静地少一条证据。挂在异常处理上是 1 个「必然」，不是 15 个「记得」。顺序也是判据要的：它在响应发出之前同步执行（`I-H3` 的压测反查仍然要人做，那是性能判定）。`action` 记**方法 + 路由模板**而不是 `request.url.path`——后者会把真实 id 写进动作列，于是「这个动作发生过多少次」变成按 id 分组的问题。`resource_kind` 从路径参数名推（`{doc_id}` → document），不让路由自己传：那是第 16 个「要记得写」的地方，而这一列错了没人会发现。`reason_code` 优先用判定层给出的（`principal_of` 把 `decision.reason` 带进异常）——**这是唯一能证伪的断言**：401 下面压着六种原因，停用的会话必须记成 `session_expired` 而不是兜底的 `unauthenticated`。404 只有一种理由（`resource_missing`）：路线按团队条件查，本来就分不出「不存在」与「属于别人」，分成两个码会让读记录的人以为自己知道了一件没验过的事。公开路径（登录 / 接受邀请）不记：那是匿名可达的写入口，一次脚本就能把表打满，而登录失败已经有 `users.failed_attempts` 在记。记录写失败 → 500，不许照常回 404：404 是一句「查过了，没有」，而系统手上没有证据。改坏验证五组：注掉写入 / 动作记真实 URL / 判定原因丢掉 / 写失败照常回 404 / 公开路径不记 → 各自对应的那条红。"
 
@@ -1585,7 +1622,7 @@ req = "REQ-AUTH-10"
 invariant = "界"
 claim = "管理员 A 管理本团队普通成员 B 允许；A 创建高于自己的角色（owner/超管）→ 403；A 停用自己 → 403 且自身 status 不变"
 negative = "只校验「是不是管理员」不校验目标角色 → 自封超管那条红；停用自己时先写后判 → status 变了，红"
-status = "partial"
+status = "pass"
 tests = [
     "tests/invariants/test_identity_policy.py::test_member_cannot_manage_anyone",
     "tests/invariants/test_identity_policy.py::test_admin_cannot_disable_themselves",
@@ -1597,8 +1634,11 @@ tests = [
     "tests/invariants/test_identity_endpoint.py::test_a_member_cannot_invite_an_admin",
     "tests/invariants/test_identity_endpoint.py::test_promoting_a_member_takes_effect_on_the_next_request",
     "tests/invariants/test_identity_endpoint.py::test_an_unknown_role_in_the_body_is_400",
+    "tests/acceptance/test_p0_auth_lifecycle.py::test_admin_cannot_change_own_role_or_disable_self",
+    "tests/acceptance/test_p0_auth_lifecycle.py::test_member_cannot_manage_and_admin_cannot_cross_the_team_boundary",
 ]
-remaining = "判定层与 HTTP 层都已验（2026-11-04 格 1/4）：非管理员 403、停用自己 403 **且 status 不变**（判定在写之前——先写后判的实现也返回 403，但那一行已经变了，而 403 让调用方以为什么都没发生）、目标角色高于自己 403、管理员管成员放行、改角色不重签票据。顺序另有一条：管理接口先 `judge_admin`（动作级，不需要目标）再查目标，否则非管理员拿一串 id 打接口时，404 与 403 的差别就是「这个人在不在」的探针；改坏验证证明把这一步挪后，那条测试会红。**还差**：判据里「A 创建高于自己的角色 → 403」在当前两档角色下不可达（管理员发 admin 邀请时 `ROLE_RANK` 相等，是允许的）；policy 层用 monkeypatch 模拟第三档角色走过真实分支，HTTP 层没有对应入口——加第三档角色时这条要补一条真实请求。"
+evidence = "2026-11-04（D3）。判定层与 HTTP 层都已验：非管理员 403（连不存在的 id 也 403，不泄露存在性）、停用自己 403 **且 status/role 不变**（判定在写之前）、改自己的角色 403、管理员管成员放行、改角色不重签票据、跨团队管理员管人 404 且与随机 id 逐字段相同。顺序另有一条：管理接口先 `judge_admin`（动作级，不需要目标）再查目标，否则非管理员拿一串 id 打接口时，404 与 403 的差别就是「这个人在不在」的探针。**边界说明**：产品当前只有 admin/member 两档，「创建高于自己的角色」在 HTTP 层不可达；policy 层用 monkeypatch 模拟第三档走过真实分支，加第三档角色时必须补一条真实请求。"
+remaining = "第三档角色尚不存在；引入 owner/超管时补 HTTP 真实请求"
 [[tool.agentworkbench.verification]]
 id = "I-V12"
 req = "REQ-AUTH-11"
@@ -1696,8 +1736,20 @@ req = "REQ-AUTH-07"
 invariant = "界"
 claim = "正确口令 / 错口令 / 不存在账号 / 锁定中，四种响应的文案与状态码一致，且响应耗时接近"
 negative = "任一条多出「锁定」「不存在」「还剩 N 分钟」→ 不通过；或不存在账号时立刻返回（跳过假哈希）→ 响应快慢成了账号枚举器"
-status = "manual"
-evidence = "未验（2026-11-04 更新）：三条已经自动化了——「假哈希被执行过」（`test_unknown_email_still_runs_a_password_verification`）、「口令错 / 不存在返回同一个原因码」（`test_wrong_password_is_rejected_without_naming_the_account`）、以及 HTTP 层「停用 / 锁定与不存在账号的响应剥掉 request_id 后逐字段相同」（`test_a_disabled_account_looks_exactly_like_a_wrong_password` / `test_a_locked_account_looks_exactly_like_a_wrong_password`）。仍然要人看的：「看起来像不像同一个错误」这句话本身，以及四条路径的真耗时差异——自动化只能证「机制在」，证不了「像不像」。"
+status = "partial"
+tests = [
+    "tests/invariants/test_identity_service.py::test_unknown_email_still_runs_a_password_verification",
+    "tests/invariants/test_identity_service.py::test_wrong_password_is_rejected_without_naming_the_account",
+    "tests/invariants/test_identity_service.py::test_failures_accumulate_and_lock_at_the_configured_threshold",
+    "tests/invariants/test_identity_service.py::test_locked_account_is_stopped_on_the_login_path_only",
+    "tests/invariants/test_identity_service.py::test_lockout_expires_by_clock_without_any_write",
+    "tests/invariants/test_identity_endpoint.py::test_a_disabled_account_looks_exactly_like_a_wrong_password",
+    "tests/invariants/test_identity_endpoint.py::test_a_locked_account_looks_exactly_like_a_wrong_password",
+    "tests/acceptance/test_p0_auth_lifecycle.py::test_lockout_blocks_only_new_logins_and_expires",
+    "tests/acceptance/test_p0_auth_lifecycle.py::test_disable_then_enable_does_not_revive_the_old_cookie",
+]
+evidence = "2026-11-04（D3）。功能面已自动化：未知邮箱仍执行假哈希；口令错/不存在返回同一原因码；停用/锁定与不存在账号的响应剥掉 request_id 后逐字段相同；连续失败到阈值后正确口令也被拒；锁定只拦登录路径，已登录会话仍可用；锁定按时间到期，不靠清列；停用/恢复不复活旧 cookie。仍差：四条路径的真实耗时差异（侧信道）与「人看起来像不像同一个错误」的观感复核。"
+remaining = "耗时侧信道与文案观感未验（人工/D8）"
 
 [[tool.agentworkbench.verification]]
 id = "I-H3"
@@ -1706,7 +1758,10 @@ invariant = "记"
 claim = "拿一条真实 404，在拒绝记录里看到人、动作、原因、时间；对照实验是不查记录时同样的问题答不出来"
 negative = "只有 404 没有记录时，同样的问题答不出来（这是对照组，不是失败案例）"
 status = "manual"
-evidence = "未验（依赖读侧）：抽样 200 次跨团队请求，覆盖率目标 100%。另有一条压测判据——关闭写入后同一压测 p95 必须下降；不降说明写入没落在响应之前。两条都要真实部署后做"
+tests = [
+    "tests/acceptance/test_p0_isolation.py::test_200_cross_team_requests_all_404_and_logged",
+]
+evidence = "2026-11-04（D2）：夹具上已做 200 次跨团队请求抽样，100% 404 且每次都能按 X-Request-Id 查到一条 `resource_missing` 记录；这是机制证据。仍待真实部署后做两件事：① 同一压测的覆盖率复核；② 关闭写入后 p95 必须下降——不降说明写入没落在响应之前。"
 
 [[tool.agentworkbench.verification]]
 id = "I-H4"
@@ -1715,7 +1770,7 @@ invariant = "属"
 claim = "打开他人会话链接，看到「资源不存在」且页面不空转"
 negative = "白屏、转圈或「重试」按钮 → 不通过（用户会以为系统坏了，然后反复重试）"
 status = "manual"
-evidence = "未验：前端还没接身份，等路由落地后人工看"
+evidence = "D3 后端无法覆盖：这是「打开他人会话链接看到资源不存在且页面不空转」的前端行为，需 D7 用浏览器/Playwright 或人工检查。后端侧 404 响应已由 D2/C-V1 保证。"
 
 [[tool.agentworkbench.verification]]
 id = "I-H5"
