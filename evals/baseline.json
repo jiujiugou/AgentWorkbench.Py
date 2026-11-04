@@ -1,0 +1,78 @@
+{
+  "generated_at": "2026-11-02T15:11:49",
+  "duration_seconds": 1.9,
+  "fixture": {
+    "file": "agentworkbench.db",
+    "sha256_12": "5455a01a2e3a",
+    "bytes": 10579968
+  },
+  "index": {
+    "documents": 63,
+    "chunks": 532,
+    "fts_rows": 532,
+    "vectors": 532,
+    "searchable": 63,
+    "consistent": true
+  },
+  "chunks": {
+    "total": 532,
+    "seams": 469,
+    "suspect_places": 40,
+    "suspect_blocks": 40,
+    "ratio": 7.52,
+    "threshold": 5.0
+  },
+  "retrieval": {
+    "top_k": 5,
+    "tokenizer": "bigram",
+    "by_kind": {
+      "literal": {
+        "n": 7,
+        "hit_rate": 0.857,
+        "mrr": 0.857
+      },
+      "paraphrase": {
+        "n": 23,
+        "hit_rate": 0.913,
+        "mrr": 0.672
+      },
+      "ambiguous": {
+        "n": 2,
+        "hit_rate": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "overall": {
+      "n": 32,
+      "hit_rate": 0.906,
+      "mrr": 0.733
+    },
+    "misses": {
+      "literal": [
+        "q21"
+      ],
+      "paraphrase": [
+        "q13",
+        "q19"
+      ]
+    },
+    "negative": {
+      "count": 8,
+      "nonempty": 7,
+      "detail": {
+        "q33": 5,
+        "q34": 0,
+        "q35": 5,
+        "q36": 5,
+        "q37": 5,
+        "q38": 5,
+        "q39": 5,
+        "q40": 5
+      }
+    }
+  },
+  "crashed": [],
+  "quality_notes": [
+    "接缝率 7.52% 高于目标 5.0%"
+  ]
+}

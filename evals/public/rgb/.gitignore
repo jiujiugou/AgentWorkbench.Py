@@ -1,0 +1,4 @@
+# 35MB 数据不进版本库：体积 + CC BY-NC-SA 许可（非商业）
+# 换机器时用 evals/public/README.md 里的 git clone 命令重取
+data/
+__pycache__/
