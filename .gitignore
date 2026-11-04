@@ -26,6 +26,9 @@ evals/reports/
 # 本地运行时产物：库文件与上传的文件
 data/
 
+# 验收证据：每次执行的原始输出不进版本库
+reports/
+
 # 内部工作笔记与 AI 协作记忆：不发布
 .workbuddy/
 
