@@ -1,0 +1,2134 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentworkbench"
+version = "0.0.0"
+description = "面向企业团队的多用户 AI 知识工作台（C# 版重写）"
+requires-python = ">=3.12"
+# 这一组就是 F2 §2 组件表。**写了不用会被 deptry 抓到（DEP002），
+# 不在表里却用了也会被抓到（DEP001）**——组件表从此不是文档，是依赖声明。
+dependencies = [
+    "sqlite-vec>=0.1.9",   # vec0 虚表：不装它连 count(*) 都报 no such module
+    "huey>=3.5",           # 解析队列：重试退避 + 周期任务（V-7 的定时扫描靠它）
+    "alembic>=1.20",       # 迁移：一条 initial 从现状反推，之后逐条追加
+    "sqlalchemy>=2.0",     # alembic 的迁移环境直接 import 它的连接对象
+    "pypdf>=6.21",         # PDF 抽取：页码是引用的锚点
+    "python-docx>=1.2",    # Word 抽取：段落与表格按文档流顺序读（顺序靠 body 遍历，不靠两个 API 各读一遍）
+    "openpyxl>=3.1",       # Excel 抽取：read_only 流式读 + merged_cells 精确填合并区域
+    "fastapi>=0.115",      # HTTP 契约与 OpenAPI（F6 §2.1 已定，前端移植的前提）
+    "uvicorn>=0.34",       # ASGI 运行时：只当启动命令用，不被业务代码 import
+    "pydantic>=2.10",      # 只在 api 层做 DTO（camelCase 出网）；core 用 dataclass
+    "pydantic-settings>=2.7",  # 配置唯一入口：缺项按类型报错，不变成 None
+    "python-multipart>=0.0.20",  # fastapi 解析 multipart 上传的运行时依赖，本仓不直接 import
+    "llama-index-core>=0.14",  # 切块：SentenceSplitter 800/120，T-001 定案（11 组里唯一追平 C# 基线）
+    "openai>=1.100",  # 模型调用：OpenAI 兼容协议（C# ChatClientFactory 同构，base_url 覆盖切供应商）
+    "cryptography>=45",  # Fernet：api_key 库内密文（F6 §1.5①）；密钥从环境变量派生，明文不落库
+    "httpx>=0.27",  # HTTP 客户端：smoke 脚本（REQ-17 的验收物）与供应商连通性探测（F6 §2.1）
+    "starlette>=0.41",  # 直接 import 的 ASGI 原语（MutableHeaders / 类型）：request_id 中间件用
+    "pwdlib[argon2]>=0.2",  # 口令哈希（F1）：argon2id + verify_and_update，参数调高后登录时平滑重哈希
+]
+
+# ─────────────────────────────────────────────────────────────
+# 组件决定表
+# ─────────────────────────────────────────────────────────────
+# 这里记的是「已经决定用什么」，机器读得懂，所以能被强制。
+# 四条规则由 tests/test_gates.py::test_component_table_matches_dependencies 执行：
+#   ① adopted 的包，必须在 [project].dependencies 里（定了不用 = 红）
+#   ② dependencies 里的包，必须在这里且是 adopted（用了没定 = 红）
+#   ③ rejected 的包，src/ 里不许 import（偷偷用被否掉的东西 = 红）
+#   ④ rejected 的条目必须在 reason 里写出重开条件（"为什么不用"不许只是一句话，
+#      也就没有下文了——没有重开条件的拒绝，半年后没人敢动它）
+# planned 表示「批准了但还没接」，此时不许出现在 dependencies，也不许 import。
+#
+# ── 什么算「该用库」（2026-11-04 定，F1 讨论的结果）──
+# 判据只有一条：**这件事在行业里有没有标准形态。**
+#   有标准形态 → 用库。口令哈希、加密、迁移、HTTP 框架、解析器都属此类；
+#                自己写等于把安全边界建立在自己写的密码学/协议实现上。
+#   没标准形态 → 不假装用库。本项目的授权与隔离（"这条消息属于哪个团队"、
+#                "删除时哪些行必须一起消失"）不在任何库的视野里——它们由**你的
+#                表结构**决定。硬塞一个框架进来，得到的是"框架 + 仍然手写的 16 项"，
+#                外加一层与现有裸 sqlite3 并存的存储习语。
+# 所以这张表里 adopted 与 rejected 都是结论，不是偏好；每条 rejected 都要能回答
+# "什么条件下我会重新考虑它"。
+[[tool.agentworkbench.component]]
+capability = "向量存储"
+package = "sqlite-vec"
+modules = ["sqlite_vec"]
+status = "adopted"
+
+[[tool.agentworkbench.component]]
+capability = "解析队列"
+package = "huey"
+modules = ["huey"]
+status = "adopted"
+
+[[tool.agentworkbench.component]]
+capability = "迁移"
+package = "alembic"
+modules = ["alembic"]
+status = "adopted"
+
+[[tool.agentworkbench.component]]
+capability = "迁移环境的连接"
+package = "sqlalchemy"
+modules = ["sqlalchemy"]
+status = "adopted"
+# 这条不是「我们决定用 ORM」，是「alembic 的 env.py 要一个连接对象」——
+# 两者差别很大：业务读写路径刻意继续用裸 sqlite3 + 手写 SQL，因为 65 处仓储
+# 函数、`conn` 第一参数的统一签名是一整套习语，混进 ORM 就是两套。
+# 这条边界由 test_scoped_components_are_only_imported_where_allowed 守着。
+allowed_in = ["src/agentworkbench/db/migrations/"]
+reason = "只用于 alembic 迁移环境（`db/migrations/env.py` 建连接与 pool）。**业务路径不用**：SQL 的形态由表结构决定，不由库决定，换成 Core 写出来还是同样几条 join 与 where；而代价是两套存储习语并存，或一次性迁移全部仓储与 500 条测试。重开条件：换成 PostgreSQL 时工具链会一并带进来，届时整体重估——本仓另有 `postgresql` 一条记着那条路的完整取舍。"
+
+[[tool.agentworkbench.component]]
+capability = "PDF 抽取"
+package = "pypdf"
+modules = ["pypdf"]
+status = "adopted"
+
+[[tool.agentworkbench.component]]
+capability = "Word 抽取"
+package = "python-docx"
+modules = ["docx"]
+status = "adopted"
+
+[[tool.agentworkbench.component]]
+capability = "Excel 抽取"
+package = "openpyxl"
+modules = ["openpyxl"]
+status = "adopted"
+
+[[tool.agentworkbench.component]]
+capability = "凭据列加密"
+package = "cryptography"
+modules = ["cryptography"]
+status = "adopted"
+reason = "F6 §1.5①：api_key 库内密文（Fernet，密钥从 AWB_SECRET_KEY 派生）。手搓 XOR 流加密等于把「备份文件被拷走」这条防线建立在自己写的密码学上——那正是组件表存在的理由。"
+
+[[tool.agentworkbench.component]]
+capability = "HTTP 客户端"
+package = "httpx"
+modules = ["httpx"]
+status = "adopted"
+reason = "F6 §2.1：smoke 脚本（REQ-17 的验收物，scripts/smoke.py）与供应商连通性探测。同步 requests 在 async 路径上会卡事件循环（代码规范 §4.1），httpx 两边都有。"
+
+[[tool.agentworkbench.component]]
+capability = "ASGI 原语"
+package = "starlette"
+modules = ["starlette"]
+status = "adopted"
+reason = "fastapi 的地基，request_id 中间件直接 import 它的 MutableHeaders 与 ASGI 类型——直接用了就声明，不藏在传递依赖里。"
+
+[[tool.agentworkbench.component]]
+capability = "HTTP 服务"
+package = "fastapi"
+modules = ["fastapi"]
+status = "adopted"
+reason = "F6 §2.1：路由 + 请求校验 + OpenAPI 一体；换 Flask 等于放弃类型契约。"
+
+[[tool.agentworkbench.component]]
+capability = "ASGI 运行时"
+package = "uvicorn"
+modules = []
+status = "adopted"
+reason = "只当启动命令，不被 import；deptry DEP002 豁免已注明。"
+
+[[tool.agentworkbench.component]]
+capability = "请求/响应模型"
+package = "pydantic"
+modules = ["pydantic"]
+status = "adopted"
+reason = "只在 api 层出 camelCase DTO；core 保持 dataclass，校验库不进核心。"
+
+[[tool.agentworkbench.component]]
+capability = "配置"
+package = "pydantic-settings"
+modules = ["pydantic_settings"]
+status = "adopted"
+reason = "REQ-22：缺项按类型报错。手写 os.environ 会静默用错值。"
+
+[[tool.agentworkbench.component]]
+capability = "multipart 上传解析"
+package = "python-multipart"
+modules = []
+status = "adopted"
+reason = "fastapi 的 UploadFile 必需运行时依赖，在其内部 import；本仓不直接用。"
+
+# ─────────────────────────────────────────────────────────────
+# 验证登记表（F2 §四 的机器可读版）
+# ─────────────────────────────────────────────────────────────
+# 文档管「为什么」，这张表管「验到哪了」。四条规则由
+# tests/test_gates.py::test_verification_table_matches_tests 执行：
+#   ① F2 的 V-1~V-12 与 F3 的 G1~G15 一条不能少（悄悄删掉一条 = 漏验）
+#   ② status=pass 的条目，tests 列的每个 `文件::函数` 必须真实存在
+#      —— 测试被删了、改名了、跳过了，这里当场红
+#   ③ partial 必须写 remaining（还差什么）；fail 必须写 reason（为什么没过）；
+#      manual 必须写 evidence（人工怎么验、验没验）
+#   ④ 每条必须有 claim（正控判据）与 negative（负控判据）——
+#      F2 §四的原话：写不出反例的断言不要写
+#
+# status 取值：pass（有测试且全套绿）/ partial（部分）/ fail（验了没过）/ manual（只能人工）。
+# 改 status = 宣布一项验证结论变了，会出现在 diff 里，必须能说出理由。
+[[tool.agentworkbench.verification]]
+id = "V-1"
+req = "REQ-05"
+claim = "传一份 PDF → 202、列表一行、磁盘恰好一个文件"
+negative = "同一文件传两次：documents 恰好 1 行、磁盘恰好 1 份；删掉唯一索引后必须变 2 行（证明去重是约束在起作用，不是先查再插）"
+status = "pass"
+tests = [
+    "tests/invariants/test_ingest_pipeline.py::test_upload_returns_pending_not_parsed",
+    "tests/invariants/test_ingest_pipeline.py::test_duplicate_upload_reuses_row_and_one_file_on_disk",
+    "tests/invariants/test_ingest_pipeline.py::test_unique_index_is_what_actually_dedupes",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-2"
+req = "REQ-05"
+claim = "DOCX / 空文件 / 超限 / 无 file 字段，四种各返回对应 code 与 400"
+negative = "拒收后盘上文件数、documents 行数、队列任务数三者都不变——只断言「返回 400」的实现过不了这条"
+status = "pass"
+tests = [
+    "tests/invariants/test_upload_codes.py::test_no_file",
+    "tests/invariants/test_upload_codes.py::test_empty_beats_bad_type_and_size",
+    "tests/invariants/test_upload_codes.py::test_type_beats_size",
+    "tests/invariants/test_upload_codes.py::test_too_large",
+    "tests/invariants/test_upload_codes.py::test_boundary_is_inclusive",
+    "tests/invariants/test_ingest_pipeline.py::test_rejected_upload_leaves_nothing",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-3"
+req = "REQ-05 / 06"
+claim = "扫描件 PDF → 明确 no_text_layer、状态 failed、可读文案"
+negative = "同一份文件：chunks = 0、chunks_fts 无该文档行、文件名里的词检索 0 命中；留 failed 记录是对的，留索引行是错的"
+status = "pass"
+tests = [
+    "tests/invariants/test_parse_failure.py::test_all_pages_blank",
+    "tests/invariants/test_parse_failure.py::test_whitespace_only_is_blank",
+    "tests/invariants/test_parse_failure.py::test_empty_sequence_is_failure",
+    "tests/invariants/test_ingest_pipeline.py::test_no_text_layer_fails_and_is_not_searchable",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-4"
+req = "REQ-06"
+claim = "慢解析下 pending → parsing → parsed 三次都能观测到（轮询条件，不 sleep）"
+negative = "造一条 status=parsed、chunks=0 的行 → 列表必须显示不可检索（a 类）"
+status = "pass"
+tests = [
+    "tests/invariants/test_ingest_pipeline.py::test_upload_returns_pending_not_parsed",
+    "tests/invariants/test_ingest_pipeline.py::test_worker_takes_pending_to_parsed_and_searchable",
+    "tests/invariants/test_api_end_to_end.py::test_v4_parsing_state_is_observable",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-5"
+req = "REQ-06"
+claim = "failed 文档的独有词检索 0 命中；答案侧明确「资料里没有」"
+negative = "造一份 status=failed 但 chunks_fts 有行的库副本，必须被一致性检查报出（[f] 类）"
+status = "pass"
+tests = [
+    "tests/invariants/test_ingest_pipeline.py::test_no_text_layer_fails_and_is_not_searchable",
+    "tests/invariants/test_index_consistency.py::test_failed_but_searchable",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-6"
+req = "REQ-06"
+claim = "造一条 pending → 重启进程 → 被捡起并走到终态"
+negative = "把队列换回内存 Channel（C# 写法）→ 重启后该行仍 pending → 本项必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_ingest_pipeline.py::test_recover_pending_requeues_both_pending_and_parsing",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-7"
+req = "REQ-06"
+claim = "parsing 超过 T 分钟无进展 → 判 failed / parse_stalled，T 可配置"
+negative = "parsing 但 updated_at 很新 → 不能被误杀；created_at 很老也不能作为判据（慢 ≠ 死）"
+status = "pass"
+tests = [
+    "tests/invariants/test_parse_stalled.py::test_stale_parsing_is_killed_and_index_cleared",
+    "tests/invariants/test_parse_stalled.py::test_fresh_parsing_is_not_killed",
+    "tests/invariants/test_parse_stalled.py::test_old_created_at_alone_does_not_kill",
+    "tests/invariants/test_parse_stalled.py::test_threshold_is_configurable",
+    "tests/invariants/test_parse_stalled.py::test_parsed_documents_are_never_touched",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-8"
+req = "REQ-10"
+claim = "独有词 → 命中 → 删除 → 同词 0 命中，且 fts / vec / chunks 三处该文档行数全 0"
+negative = "只删 documents 行、不删索引（模拟半成功）→ 检索仍命中 → 必须红；这是「删除」与「列表消失」的分界线"
+status = "pass"
+tests = [
+    "tests/invariants/test_delete_compensation.py::test_happy_path_clears_all_four_places",
+    "tests/invariants/test_delete_compensation.py::test_leftover_index_keeps_record_and_delete_pending",
+    "tests/invariants/test_api_end_to_end.py::test_v8_delete_makes_term_unsearchable",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-9"
+req = "REQ-10"
+claim = "注入「删索引成功、删记录失败」→ 列表显示 delete_pending（不是正常），重试后转终态"
+negative = "把 delete_pending 从状态机里删掉（失败就报 500、记录保持 parsed）→ 本项必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_delete_compensation.py::test_reentry_after_failure_finishes_the_job",
+    "tests/invariants/test_api_end_to_end.py::test_v9_delete_pending_visible_then_retry_succeeds",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-10"
+req = "REQ-06 / 10"
+claim = "七类（a / b1 / b2 / c1 / c2 / e / f）全 0，且库级真空那条在空库时必须报出"
+negative = "注入五类坏数据（删全文行 / 删向量 / parsed 无块 / 单块删唯一全文行 / failed 但全文在），必须全部报出且类别正确"
+status = "pass"
+tests = [
+    "tests/invariants/test_index_consistency.py::test_fixture_is_clean",
+    "tests/invariants/test_index_consistency.py::test_parsed_without_chunks",
+    "tests/invariants/test_index_consistency.py::test_chunk_without_fts",
+    "tests/invariants/test_index_consistency.py::test_fts_without_chunk",
+    "tests/invariants/test_index_consistency.py::test_chunk_without_vector",
+    "tests/invariants/test_index_consistency.py::test_vector_without_chunk",
+    "tests/invariants/test_index_consistency.py::test_library_vacuum",
+    "tests/invariants/test_index_consistency.py::test_failed_but_searchable",
+    "tests/invariants/test_index_consistency.py::test_searchable_document_is_reachable_by_match",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-11"
+req = "T-001"
+claim = "疑似切断块 / 总块数 ≤ 5%"
+negative = "sample_chunks.py --selftest：注入词内切断、连词悬空、标题半句三处，必须全部报出且类别正确（只报出不分类不算过）"
+status = "fail"
+reason = "llama 切块已接入（T-002）：7.52%（532 块 40 处），仍超 5%。C# 基线同样没过（7.29%）。剩余接缝源于无标点结构（表格/代码行），按句子切的组件都救不了，归解析层决定（原 C 选项）。检索侧已兑现：HitRate 0.812→0.906、MRR 0.588→0.733"
+
+[[tool.agentworkbench.verification]]
+id = "V-12"
+req = "REQ-07"
+claim = "抽 10 条引用人工翻到对应页，10/10 该页能找到片段首 20 字"
+negative = "把 page_from 全写成 1 → 抽样必须判红（抽样前不知道哪条被改过）"
+status = "manual"
+evidence = "未验。需人工抽样；且解析层页码精度矛盾未解决（pdf.py 注释说只到第 1 页，切块却按页带 page_from）"
+
+# ── 2026-11-04 补：Office 格式（Word / Excel）──
+# 这一段推翻了 F2 §5.1 原来那句「PDF 以外的格式不做」。推翻的理由不是
+# 「做起来不难」，是目标场景变了：制造业的 SOP 在 Word、BOM 与检验记录在
+# Excel，只收 PDF 等于把最想问的那批资料挡在门外。
+# 边界仍在（§5.1 已改）：图片、网页、.doc/.xls 旧二进制格式照旧不做，
+# 理由是它们要么需要 OCR/渲染，要么需要 antiword/LibreOffice 这类外挂。
+#
+# 三条设计约束写在这里，因为它们是判据的共同前提：
+# ① 归一化成 list[str]（「段」）——切块/索引/检索/引用四处一行不改
+# ② 分派按后缀，不嗅探魔数——docx 与 xlsx 都是 zip，嗅探要多解一层而结论相同
+# ③ 失败仍走 DocumentErrorCode，不新开一套码
+
+[[tool.agentworkbench.verification]]
+id = "V-13"
+req = "REQ-05"
+claim = "上传收 PDF / DOCX / XLSX 三类；.doc / .xls / .xlsm / 图片 / 文本一律 FILE_TYPE_UNSUPPORTED"
+negative = "从白名单删掉 .xlsx → 参数化那条必须红；把 .xlsm 放进白名单 → 也必须红（openpyxl 能打开它，于是「收了但静默丢宏」，用户以为公式还在）"
+status = "pass"
+tests = [
+    "tests/invariants/test_office_parser.py::test_the_three_formats_are_accepted",
+    "tests/invariants/test_office_parser.py::test_legacy_and_foreign_formats_are_refused",
+]
+evidence = "2026-11-04。`DEFAULT_ALLOWED_SUFFIXES` 三类；`.xlsm` 刻意不收——openpyxl 能打开它但**静默丢宏**，用户以为公式还在，收了比拒了更坏。拒收文案列三类（`api/errors.py` 的 UPLOAD_MESSAGES）。改坏：白名单删掉 .xlsx → 参数化那条红。已知的最短缺口：判定层（judge_upload）与真实 docx 字节的解析分属两处测试，没有一条同时含真 docx 字节与真分派的 HTTP 端到端——补进端到端那格最合身"
+
+[[tool.agentworkbench.verification]]
+id = "V-14"
+req = "REQ-05 / 06"
+claim = "Word 的段落与表格按文档流顺序抽出，整篇算一段（page_count = 1）"
+negative = "改回「先读 paragraphs 再读 tables」→ 顺序那条必须红；只读 paragraphs → 表格那条必须红；按标题分段 → 单段那条必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_office_parser.py::test_word_keeps_paragraph_table_paragraph_order",
+    "tests/invariants/test_office_parser.py::test_word_tables_are_extracted_at_all",
+    "tests/invariants/test_office_parser.py::test_word_is_a_single_segment",
+]
+evidence = "2026-11-04。保序的实现是遍历 `document.element.body` 按 `w:p` / `w:tbl` 分派——`paragraphs` 与 `tables` 是两套视图，各读一遍会把表格全搬到文末。改坏两组：只读段落（表格全丢）→ 表格那条红；先段落再表格（乱序）→ 顺序那条红。测试 fixture 本身踩过一个坑并留了防呆：表格块写成两层的 list 时，行被逐字符迭代成一张鬼表（列数 = 首字符串长度），helper 里加断言挡在构造期"
+
+[[tool.agentworkbench.verification]]
+id = "V-15"
+req = "REQ-05 / 06"
+claim = "Excel 每个工作表一段、段首带 sheet 名；合并区域的值填到它覆盖的每一行"
+negative = "不填合并 → 只数到 1 行「焊接」（应该 3 行）；不分工作表 → 两段并成一段，sheet 名对不上；只填第一列之外不管 → 参数行那条必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_office_parser.py::test_each_sheet_is_its_own_segment",
+    "tests/invariants/test_office_parser.py::test_merged_cells_are_filled_into_every_row",
+]
+remaining = "已知限制（非缺口）：引用只能定位到工作表，定位不到行——要行号得把「段」换成带行列号的单元，改切块与引用的契约，重开条件记在 F2 §5.3"
+evidence = "2026-11-04。合并填充只对 `merged_cells.ranges` 声明的范围做，**不做列内向下填充**——那会把表尾「合计」行的空格填成上一行的值，而合计恰恰最不该被归属到某个工序。更强的断言一侧：每行除了「焊接」还要带上自己那行的参数，否则「填了但填错行」也能过。改坏两组：不填合并 → 只数到 1 行；拼成一段 → sheet 名对不上。内存的已知限制写在 `office.py` 的 MAX_ROWS_PER_SHEET 注释（openpyxl 合并信息只在非 read_only 模式可用）"
+
+[[tool.agentworkbench.verification]]
+id = "V-16"
+req = "REQ-05 / 06"
+claim = "Office 文件抽不出文字时归 no_text_layer，与扫描件 PDF 同一个码"
+negative = "归成 corrupt 或 extract_error → 必须红；静默收下一份空文档（页文本为空但不抛）→ 与已实现的 V-3 同类，必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_office_parser.py::test_office_without_text_is_no_text_layer",
+]
+remaining = "加密 docx/xlsx 的识别（OLE 魔数 → `encrypted`）已实现（`office.py` 的 `_reject_ole`）但无专门测试——它覆盖「用户动作是解除密码而不是重新导出」这半条，补测试时并进本条即可"
+evidence = "2026-11-04。这个码决定用户看到的话：no_text_layer 是「这是扫描件/截图，需要识别」，corrupt 是「文件坏了，请重新导出」——两句话对应两个动作，混成一个之后统计也分不出「这个月多少件是扫描件」，而那是要不要做 OCR 的唯一依据。改坏：归成 corrupt → 红"
+
+[[tool.agentworkbench.verification]]
+id = "V-17"
+req = "REQ-05 / 06"
+claim = "损坏的 Office 文件是 corrupt；未注册的后缀抛 UnsupportedFormat；.pdf 仍走 pypdf"
+negative = "未知后缀回落到 PDF → 那条必须红（.txt 会被报成 corrupt，归因错一层）；分派时把 .pdf 也一起拒掉 → 正控那条必须红；损坏归成 extract_error → 必须红（前者重试一定失败，后者可能成功）"
+status = "pass"
+tests = [
+    "tests/invariants/test_office_parser.py::test_a_broken_office_file_is_corrupt",
+    "tests/invariants/test_office_parser.py::test_an_unknown_suffix_is_refused_not_parsed_as_pdf",
+    "tests/invariants/test_office_parser.py::test_pdf_still_goes_to_pypdf",
+]
+remaining = "worker 里的防御路径（后缀绕过上传校验 → `UNSUPPORTED_FORMAT`，新码）已实现无专门测试——它只在上传校验被绕过时可达，补测试时并进本条"
+evidence = "2026-11-04。正控那条不是凑数：缺了它，「把所有后缀都抛 UnsupportedFormat」的空实现能过负控两条。损坏归 corrupt 而非 extract_error：前者重试一定失败，后者可能成功，用户动作不同。dispatch 对解析器未接住的异常统一兜 corrupt（输入已过上传校验，最可能是内容与后缀不符）。改坏：回落到 parse_pdf → 负控红"
+
+[[tool.agentworkbench.verification]]
+id = "V-18"
+req = "REQ-05 / 06"
+claim = "单个工作表的读取行数有上限，截断时在正文里说出来"
+negative = "去掉上限 → 上限那条必须红；截断但不说 → 「截断」字样的断言必须红；上限写成常量而测试传不进参数 → 参数化那条没法验，等于没测"
+status = "pass"
+tests = [
+    "tests/invariants/test_office_parser.py::test_rows_are_capped",
+]
+remaining = "内存的已知限制：openpyxl 合并信息只在非 read_only 模式可用，普通模式解析全量进内存；十万行约几百 MB 可接受，百万行是重开条件（read_only + 自行解析 mergeCells），写在 `office.py` 注释"
+evidence = "2026-11-04。上限防的是「一个 sheet 把解析进程拖垮、连带同进程其它文档一起失败」。截断在正文里说出来——静默截断会让用户以为整张表都在，而答案是按前 2000 行给的。改坏两组：去上限 → 行5 出现；截断不标注 → 「截断」断言红。max_rows 口径是**物理行含表头**，测试里注释写明"
+
+# ─────────────────────────────────────────────────────────────
+# F3 验证登记表（F3-功能验证 §4.2 的 G1~G15，机器可读版）
+# ─────────────────────────────────────────────────────────────
+# C# 版的实测结论写进 evidence/reason 作设计输入；status 一律描述
+# Python 侧现状——这张表是 Python 版的验证台账，不是 C# 的成绩单。
+# G1 与 V-10、G2 与 V-11 是同一验证对象在两个域文档里的编号，
+# 两边都登记（删哪边都该红），数字与结论以先验的为准。
+[[tool.agentworkbench.verification]]
+id = "G1"
+req = "REQ-07"
+claim = "63 文档 / 块数 / 全文索引 / 向量三处相等，五类检查全 0"
+negative = "注入五类破坏：删全文行、删向量、parsed 无块、单块文档删唯一全文行、空库——必须全部报出且类别正确"
+status = "pass"
+tests = [
+    "tests/invariants/test_index_consistency.py::test_fixture_is_clean",
+    "tests/invariants/test_index_consistency.py::test_parsed_without_chunks",
+    "tests/invariants/test_index_consistency.py::test_chunk_without_fts",
+    "tests/invariants/test_index_consistency.py::test_fts_without_chunk",
+    "tests/invariants/test_index_consistency.py::test_chunk_without_vector",
+    "tests/invariants/test_index_consistency.py::test_vector_without_chunk",
+    "tests/invariants/test_index_consistency.py::test_library_vacuum",
+    "tests/invariants/test_index_consistency.py::test_failed_but_searchable",
+    "tests/invariants/test_index_consistency.py::test_searchable_document_is_reachable_by_match",
+]
+evidence = "与 V-10 同一验证对象。llama 库：63 文档 / 532 块 / 三处全等；C# 基线 439 块同样全 0"
+
+[[tool.agentworkbench.verification]]
+id = "G2"
+req = "REQ-07"
+claim = "接缝数可数、四类异常归类正确，接缝率 ≤ 5%"
+negative = "接缝率 > 5% 判红；注入词内切断、连词悬空、标题半句三类必须全报出"
+status = "fail"
+reason = "与 V-11 同一验证对象：llama 库 7.52%（532 块 40 处），C# 基线 7.29% 同样不过。剩余接缝源于无标点结构（表格/代码行），归解析层决定"
+
+[[tool.agentworkbench.verification]]
+id = "G3"
+req = "REQ-07"
+claim = "40 题按档可复算：literal / paraphrase / ambiguous 各有 HitRate 与 MRR，数字进 baseline.json"
+negative = "8 条负控应当 0 条召回非空——实测 7 条非空，检索层无拒答能力（本域最重要的一张实测表）"
+status = "partial"
+tests = [
+    "tests/invariants/test_retriever.py::test_rrf_formula_single_route",
+    "tests/invariants/test_retriever.py::test_two_routes_add_scores",
+    "tests/invariants/test_retriever.py::test_vector_distance_kept_text_route_none",
+    "tests/invariants/test_retriever.py::test_fusion_score_never_used_for_judgment",
+    "tests/invariants/test_retriever.py::test_top_k_truncation",
+    "tests/invariants/test_retriever.py::test_empty_query_returns_empty",
+    "tests/invariants/test_retriever.py::test_vector_route_always_returns_nearest",
+    "tests/invariants/test_retriever.py::test_same_query_same_results",
+    "tests/invariants/test_retriever.py::test_deleted_document_not_retrievable",
+    "tests/invariants/test_retriever.py::test_long_query_capped_at_max_tokens",
+    "tests/invariants/test_retriever.py::test_tenant_parameter_is_required",
+    "tests/invariants/test_query_contract.py::test_long_chinese_question_must_hit",
+    "tests/invariants/test_query_contract.py::test_match_query_uses_or_not_and",
+    "tests/invariants/test_query_contract.py::test_single_han_char_falls_back_to_like",
+    "tests/invariants/test_query_contract.py::test_production_query_matches_eval_harness",
+    # 评测脚本的索引文本复刻必须与生产 to_index_text 逐字节一致——它算错时
+    # 检测器会把正确索引报成不一致，并劝人换 --tokenizer 重跑（那才会真 0 命中）
+    "tests/invariants/test_query_contract.py::test_eval_index_text_matches_production",
+    "tests/invariants/test_query_contract.py::test_deduped_variant_is_what_broke_the_checker",
+    "tests/invariants/test_query_contract.py::test_index_format_check_accepts_a_production_built_index",
+    # 评测脚本的索引文本复刻必须与生产 to_index_text 逐字节一致——它算错时
+    # 检测器会把正确索引报成不一致，并劝人换 --tokenizer 重跑（那才会真 0 命中）
+    "tests/invariants/test_query_contract.py::test_eval_index_text_matches_production",
+    "tests/invariants/test_query_contract.py::test_deduped_variant_is_what_broke_the_checker",
+    "tests/invariants/test_query_contract.py::test_index_format_check_accepts_a_production_built_index",
+]
+remaining = "词面路已修并加锁（2026-11-02）：`to_match_query` 原用空格 = FTS5 的 AND，中文长问句切出的「是什」「么原」在任何文档都不存在，正常提问必然 0 命中且不报错——生产跑 AND、评测跑 OR，两边背离。修为 OR + 对齐 LIKE 兜底，并新增 test_query_contract 4 条（长问句必中、布尔语义、单字兜底、生产↔评测命中集合等价）。真库验证：`Modbus 异常码 0x02` 首块即 MB-001。未完：混合模式评测（run_rag_eval 只有 fts 模式）、通过线未定、语义路仍缺（embedder=None 降级形态已支持，此时判定落 UNDETERMINED）"
+
+[[tool.agentworkbench.verification]]
+id = "G4"
+req = "REQ-07"
+claim = "装填后上下文远低于模型窗口（C# 实测 2265 字 / 4089 字；Python 真库实测 2161 字，同量级）"
+negative = "构造超预算输入，必须告警而不是静默截断"
+status = "pass"
+tests = [
+    "tests/invariants/test_packing.py::test_numbering_starts_at_one_and_follows_retrieval_order",
+    "tests/invariants/test_packing.py::test_context_chars_is_sum_of_content_lengths",
+    "tests/invariants/test_packing.py::test_exceeds_budget_strictly_greater",
+    "tests/invariants/test_packing.py::test_unset_budget_never_warns",
+    "tests/invariants/test_packing.py::test_evidence_three_sections_from_one_retrieval",
+    "tests/invariants/test_packing.py::test_judgment_is_carried_not_recomputed",
+    "tests/invariants/test_packing.py::test_empty_retrieval_packs_empty_evidence",
+    "tests/invariants/test_packing.py::test_evidence_is_frozen",
+    "tests/invariants/test_packing.py::test_numbered_hit_fields_carry_citation_facts",
+]
+evidence = "装填已实现（agent/packing.py，2026-11-02）：编号在装填时刻固定（no=下标+1，D-05 编号空间封闭的物理来源）、字符预算可复算（Σcontent 长度）、超预算告警不截断、三段同源由 pack 签名强制（D-03）。改坏验证：编号 0 起算 → 红。管道级端到端（超预算输入真实告警到日志）随 D-03 接线一起验"
+
+[[tool.agentworkbench.verification]]
+id = "G5"
+req = "REQ-07"
+claim = "每次回答 tools ≥ 1——系统预检索保证，不等模型决定查不查"
+negative = "iterations=1, tools=0 必须判失败（C# run 18 真抓到一次零检索：q03 凭常识编六条建议）"
+status = "pass"
+tests = [
+    "tests/invariants/test_agent_pipeline.py::test_answered_path_calls_model_exactly_once",
+    "tests/invariants/test_agent_pipeline.py::test_refused_path_never_calls_model",
+]
+evidence = "预检索已实现（agent/runner.ask，2026-11-02）：检索是第一段必调代码，tools ≥ 1 由结构保证不是约定。管道级双断言：可答路径模型恰好 1 次调用 + 证据进 prompt；拒答路径模型 0 次调用。C# 的失败（run 18 零检索）在 Python 形态下不可能复现——模型没有工具可调"
+
+[[tool.agentworkbench.verification]]
+id = "G6"
+req = "REQ-08"
+claim = "每句有 [n] 角标，越界编号 0"
+negative = "整段零角标必须被抓（C# 实测抓到一次：q03 十句全裸）"
+status = "partial"
+tests = [
+    "tests/invariants/test_agent_pipeline.py::test_citation_verification_integrated",
+    "tests/invariants/test_agent_pipeline.py::test_answered_path_calls_model_exactly_once",
+]
+remaining = "**首次产出真实回答（2026-11-02，词面路修复后）**：3 句 / 2 句有出处 / 越界 0 / 误挂 0，二级覆盖率 0.9 与 0.8 均 SUPPORTED。新事实：模型不会给每句都加角标（那句未加角标的是承接上文的补充说明），所以 claim 的字面值「每句」可能过严，真实判据应是「每个可独立核实的断言有角标」——这个口径需要多次采样统计后再定，样本 n=1 不足以改口径。零角标检测由 ④ verify 的 uncited 计数承担，机制已在；缺的是「整段零角标必须被抓」的负控用例"
+
+[[tool.agentworkbench.verification]]
+id = "G7"
+req = "REQ-08"
+claim = "一级校验：合法编号保留，指向的块确实存在且属于本次检索"
+negative = "越界编号剥离；引用上一轮的证据必须被抓（C# 15 条断言通）"
+status = "pass"
+tests = [
+    "tests/invariants/test_judgment_invariants.py::test_citation_first_check_is_closed_two_values",
+    "tests/invariants/test_judgment_invariants.py::test_citation_seq_starts_at_one",
+    "tests/invariants/test_citation.py::test_in_range_kept_out_of_range_stripped",
+    "tests/invariants/test_citation.py::test_cleaned_answer_drops_out_of_range_only",
+    "tests/invariants/test_citation.py::test_keep_citations_filters_per_number",
+    "tests/invariants/test_citation.py::test_no_evidence_everything_stripped",
+]
+evidence = "一级校验已实现（guard/citation.py，2026-11-02）：越界 STRIPPED 且 cleaned_answer 摘掉假担保；[2,9] 只剥 9 剩 [2]（越界的是编号不是整段出处）；证据池为空则一切编号越界（编号空间封闭）。改坏验证：删归属回看逻辑 → 3 条红。『引用上一轮的证据』由编号空间封闭结构保证（每次从 1 起算，候选取自本次），管道级随 agent 编排验证"
+
+[[tool.agentworkbench.verification]]
+id = "G8"
+req = "REQ-08"
+claim = "二级校验：同主题邻块 gap ≥ 0.20 分得开"
+negative = "同主题误挂（号码对、内容不对）必须被抓——C# 实测不通过：0.091 / 0.125 / 0.000"
+status = "partial"
+tests = [
+    "tests/invariants/test_judgment_invariants.py::test_citation_second_check_has_no_maybe_verified",
+    "tests/invariants/test_citation.py::test_second_check_unverified_when_threshold_unset",
+    "tests/invariants/test_citation.py::test_second_check_supported_and_unsupported",
+    "tests/invariants/test_citation.py::test_coverage_is_reproducible",
+    "tests/invariants/test_citation.py::test_zero_threshold_is_a_real_threshold",
+]
+remaining = "机制已移植（覆盖率可复算、阈值三态 SUPPORTED/UNSUPPORTED/UNVERIFIED、误挂标 UNSUPPORTED——真库冒烟抓到编造句）。判别力仍待修（IDF 加权或关键值命中，二选一）：同主题邻块 3 组分不开是算法问题不是移植问题，修好之前 REQ-08 只做到「有出处」没做到「出处对」"
+
+[[tool.agentworkbench.verification]]
+id = "G9"
+req = "REQ-09"
+claim = "判定四值（已回答/依据较弱/资料不足/未判定）+ 原因正确；判定用间隔不用绝对距离（D-01）"
+negative = "阈值缺失 → 未判定，不是 0 分、不是已回答（D-12：空不能用 0 假装配过）"
+status = "pass"
+tests = [
+    "tests/invariants/test_judgment_invariants.py::test_exactly_four_judgment_values",
+    "tests/invariants/test_judgment_invariants.py::test_failure_is_a_run_state_not_a_judgment",
+    "tests/invariants/test_judgment_invariants.py::test_every_value_has_a_presentation",
+    "tests/invariants/test_judgment_invariants.py::test_presentations_are_mutually_distinct",
+    "tests/invariants/test_judgment_invariants.py::test_insufficient_terminates_and_hides_sources",
+    "tests/invariants/test_judgment_invariants.py::test_undetermined_discloses_and_generates",
+    "tests/invariants/test_judgment_invariants.py::test_weak_carries_verify_hint_answered_does_not",
+    "tests/invariants/test_sufficiency.py::test_no_candidates_is_insufficient_not_undetermined",
+    "tests/invariants/test_sufficiency.py::test_hits_without_distances_is_undetermined",
+    "tests/invariants/test_sufficiency.py::test_non_finite_distances_are_ignored_not_zero",
+    "tests/invariants/test_sufficiency.py::test_single_hit_is_weak_with_null_margin",
+    "tests/invariants/test_sufficiency.py::test_margin_is_mean_of_rest_minus_top",
+    "tests/invariants/test_sufficiency.py::test_input_order_is_not_trusted",
+    "tests/invariants/test_sufficiency.py::test_margin_below_threshold_is_insufficient",
+    "tests/invariants/test_sufficiency.py::test_equal_to_refuse_margin_does_not_refuse",
+    "tests/invariants/test_sufficiency.py::test_top_must_be_closer_than_sufficient_distance",
+    "tests/invariants/test_sufficiency.py::test_equal_to_sufficient_distance_is_not_answered",
+    "tests/invariants/test_sufficiency.py::test_partial_thresholds_never_answer",
+    "tests/invariants/test_sufficiency.py::test_zero_is_a_real_threshold_not_unconfigured",
+    "tests/invariants/test_sufficiency.py::test_answered_carries_no_reason_weak_and_blocked_do",
+    "tests/invariants/test_sufficiency.py::test_judgment_is_frozen",
+]
+evidence = "算术级全过（2026-11-02）：guard/sufficiency.py judge() 对齐 C# SufficiencyGate——间隔=第2~5名平均−第一名、严格比较、空命中是INSUFFICIENT无距离是UNDETERMINED、拒答单阈值即可而已回答需两阈值齐（测试阶段修正的判据分歧）。词汇表测试 7 条 + 算术 14 条。改坏验证两条命中（<= 边界漂移 / 去掉 IsComplete 保护）。管道级（D-03 判定只算一次写进工具输出）归 G10"
+
+[[tool.agentworkbench.verification]]
+id = "G10"
+req = "REQ-09"
+claim = "判不足 → 终止生成 + 归类码（REFUSED / knowledge_insufficient / 固定文案），模型只被请求 1 次"
+negative = "成对断言：同一批命中判不足停、判可答放——闸门二值且稳定（给模型申诉权 = 没有闸）"
+status = "pass"
+tests = [
+    "tests/invariants/test_veto.py::test_insufficient_stops_with_refused_and_fixed_copy",
+    "tests/invariants/test_veto.py::test_other_verdicts_pass_through",
+    "tests/invariants/test_veto.py::test_undetermined_also_passes",
+    "tests/invariants/test_veto.py::test_other_tools_are_not_vetoed",
+    "tests/invariants/test_veto.py::test_empty_or_none_result_never_vetoes",
+    "tests/invariants/test_veto.py::test_verdict_is_carried_not_recomputed",
+    "tests/invariants/test_veto.py::test_refusal_copy_is_fixed_string",
+    "tests/invariants/test_veto.py::test_stop_is_frozen",
+    "tests/invariants/test_veto.py::test_gate_is_binary_for_same_evidence",
+]
+evidence = "否决门已实现（guard/veto.py，2026-11-02）：只读装填判定不重算（签名无距离参数，重算在类型上不可能——D-03）；保守方向单向（非本工具/空结果不否决，宁可放过不可误杀）；固定文案是常量。改坏验证：闸永不拦 → 5 条红。真库全链冒烟：检索→判定→否决（knowledge_insufficient）通。「模型只被请求 1 次」的管道级 LLM 计数归 agent 编排（依赖 LLM 接入），已在 evidence 注明"
+
+[[tool.agentworkbench.verification]]
+id = "G11"
+req = "REQ-09"
+claim = "拒答卡与普通消息长得不一样，不显示来源列表与句级摘要"
+negative = "把拒答改回普通消息样式，必须一眼看出（人工，附失效条件）"
+status = "manual"
+evidence = "C# 人工通过。前端 web/ 已拷入待接 SSE；验证只能等界面接上做人工目视"
+
+[[tool.agentworkbench.verification]]
+id = "G12"
+req = "REQ-08"
+claim = "无出处句底纹 + 引用卡片四字段（文件名/序号/页码/原文片段）"
+negative = "删掉虚线类名、裁掉任一字段，必须看得出（人工，附失效条件）"
+status = "manual"
+evidence = "C# 人工通过。回原文退到片段卡片不做页面跳转（D-06，页码精度撑不起跳转）"
+
+[[tool.agentworkbench.verification]]
+id = "G13"
+req = "REQ-08"
+claim = "数值/型号归一化比对：7 个数值全中"
+negative = "5 个改错反例必须全抓"
+status = "partial"
+remaining = "C# check_values.py 通过但 n=3 太小，样本要扩。脚本在 evals/self/（md5 与 C# 原件一致）；归一化函数将来被二级校验的关键值命中复用"
+
+[[tool.agentworkbench.verification]]
+id = "G14"
+req = "REQ-09"
+claim = "完全库外判资料不足；同主题缺答案不拒只承认"
+negative = "误拒率与自信答错率同时上升的阈值格子必须排除——混档计比 = 两个数同时变假"
+status = "partial"
+tests = [
+    "tests/invariants/test_judgment_invariants.py::test_refusal_tiers_exactly_three",
+    "tests/invariants/test_judgment_invariants.py::test_tier_metric_buckets_are_disjoint",
+]
+remaining = "阈值空、run_refusal_eval.py --scan 未跑、库外题只有 3 条（q33/q34/q37）——3 个点上扫出来的阈值必过拟合，先扩到 15 条。三档必须分列（完全库外/同主题缺答案/超出检索能力），分母混了两个比率同时作假"
+
+[[tool.agentworkbench.verification]]
+id = "G15"
+req = "REQ-09"
+claim = "启动期校验：每个判定阈值有消费者且非空，缺则进程起不来"
+negative = "带着空阈值启动必须失败——「未判定」是函数层语义，不是配置缺失的藏身处（C# SufficiencyGate 36 条测试全绿、阈值 null、拒答分支一次没走过）"
+status = "partial"
+remaining = "待建。四条防空分支机制之一（另三条：探针用例三样齐断言、评测报四值分布、改坏法）。「它能报出自己执行过几次」比「它测过几次」重要"
+
+# ─────────────────────────────────────────────────────────────
+# F4 验证登记表（F4-执行与审计 §4.2 / §4.3 的 V1~V11 + H1/H2，机器可读版）
+# ─────────────────────────────────────────────────────────────
+# id 用 `A-`（Audit）前缀 + 文档原编号：A-V1b 就是文档里的 V1b，永不错位。
+# `invariant` 字段挂 F4 §1.3 的四条不变量（有 / 全 / 对 / 无后门）——
+# 它们不是四个功能，是同一条「记录必须真实且无绕过」的四个侧面，
+# 去掉任何一条另外三条的判据都会失效（§1.3 的判定法）。
+# 状态机（core/runs.py 的 RunStatus / ALLOWED_TRANSITIONS / RunReasonCode）
+# 由 A-V3、A-V4 两条守着：迁移白名单是唯一真源，测试只是执行它。
+# 现状一律描述 Python 侧：core/runs.py 的状态机、两张表、以及 trace/recorder.py
+# （唯一写入口）都已落地（2026-11-02）；运行链路还没接上——runner 仍是纯 ask，
+# 所以 A-V1/V1b/V6/V7 这几条「要真对象」的断言还停在 partial。
+
+[[tool.agentworkbench.verification]]
+id = "A-V1"
+req = "REQ-11"
+invariant = "无后门"
+claim = "声明表覆盖 app.routes 全集，逐条标「产出 run / 不产出 + 理由」"
+negative = "临时加一条 POST /api/test/answer 不声明 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_route_declarations.py::test_every_route_is_declared",
+    "tests/invariants/test_route_declarations.py::test_scanner_actually_sees_the_routes",
+    "tests/invariants/test_route_declarations.py::test_an_undeclared_route_turns_it_red",
+    "tests/invariants/test_route_declarations.py::test_declarations_do_not_drift_from_the_code",
+    "tests/invariants/test_route_declarations.py::test_a_route_cannot_be_declared_both_ways",
+    "tests/invariants/test_route_declarations.py::test_every_producing_route_is_exercised_by_a_test",
+]
+evidence = "2026-11-02。10 条业务路由全部表态（1 条产 run：POST /api/knowledge/ask；9 条不产并各写理由）。三处防漏：① 新增路由不表态 → 红；② 表里有、代码里没有（改名的残留）→ 红；③ 声明产 run 的路由必须在测试里被打过，否则「声明了」什么也不证明。**踩到一个真实的坑**：FastAPI 0.162 起 `include_router` 挂的是 `_IncludedRouter` 包装，没有 path——按老写法遍历 app.routes 会扫到 0 条业务路由，「0 条未声明」让 V1 恒真。改坏验证实测：退回老写法后 V1 那条**依然全绿**，只有自检与 drift 两条红。这就是 V1b 存在的理由，不是理论"
+
+[[tool.agentworkbench.verification]]
+id = "A-V1b"
+req = "REQ-11"
+invariant = "无后门"
+claim = "V1 自身不是恒真：注入一条假路由，断言必须报出它"
+negative = "删掉遍历循环仍全绿 → V1 作废"
+status = "pass"
+tests = [
+    "tests/invariants/test_route_declarations.py::test_an_undeclared_route_turns_it_red",
+    "tests/invariants/test_route_declarations.py::test_scanner_actually_sees_the_routes",
+]
+evidence = "2026-11-02，与 A-V1 同一次做完。两条自检：① 注入 `POST /api/test/answer` 后未声明集合恰好等于它（表非空时也报得出）；② 扫描结果必须 >= 10 条且看得见 health 与 ask——后者防的是遍历方式失效。**改坏验证给出了实据**：把扫描器退回「只遍历 app.routes」的老写法，V1 那条断言依然全绿（扫到 0 条业务路由 = 0 条未声明），红的只有这两条自检。这正好说明 V1 不能自证，必须由 V1b 托着"
+
+[[tool.agentworkbench.verification]]
+id = "A-V2"
+req = "REQ-11"
+invariant = "无后门"
+claim = "只有 trace 能 import db.repositories.runs，且只有 trace.recorder 调用它的写函数（唯一写入口是事实不是约定）"
+negative = "在 api 里加一行 import → 红；在 trace.reader 里调 close_run → 红（读侧可以 import，但调不动写）"
+status = "pass"
+tests = [
+    "tests/invariants/test_trace_write_port.py::test_only_trace_imports_the_run_repository",
+    "tests/invariants/test_trace_write_port.py::test_only_the_recorder_calls_the_write_functions",
+    "tests/invariants/test_trace_write_port.py::test_the_write_scan_actually_sees_the_recorder",
+    "tests/invariants/test_trace_write_port.py::test_scanner_actually_sees_the_recorder",
+    "tests/invariants/test_trace_write_port.py::test_import_forms_are_all_resolved",
+    "tests/invariants/test_trace_write_port.py::test_a_new_writer_anywhere_turns_it_red",
+]
+evidence = "全仓 AST 扫描（2026-11-02）：导入 run 仓储的模块集合 == {trace.recorder}。扫描器自带两条自检——必须扫到 >20 个文件、必须看得见 recorder 自己，否则空集会让断言恒真。负控是真造一个第二写入者（tmp 目录里 api/leak.py），断言抓到它。六种导入写法（绝对 / from-import / 相对 / 包内相对）都解析成绝对名，少认一种就是一条侧门"
+
+[[tool.agentworkbench.verification]]
+id = "A-V3"
+req = "REQ-12"
+invariant = "对"
+claim = "running → 任一终态通过；终态 → 任何状态抛错；终态之后追加步骤抛错"
+negative = "succeeded 后 append 步骤 / cancelled → succeeded / failed 后写成功步 → 全部抛错"
+status = "pass"
+tests = [
+    "tests/invariants/test_run_state.py::test_running_can_reach_each_terminal",
+    "tests/invariants/test_run_state.py::test_terminal_is_absorbing",
+    "tests/invariants/test_run_state.py::test_self_transition_is_illegal",
+    "tests/invariants/test_run_state.py::test_require_transition_raises_on_illegal",
+    "tests/invariants/test_recorder.py::test_no_step_after_terminal",
+    "tests/invariants/test_recorder.py::test_step_results_arriving_after_cancel_are_discarded",
+    "tests/invariants/test_recorder.py::test_storage_layer_drops_step_results_after_terminal",
+]
+evidence = "两半都验完（2026-11-02）。状态机半：白名单四条。写入半：四种终态各调一次 `recorder.step` 全抛 IllegalTransition 且步骤表 0 行（含 A-V3 反例原文「failed 后写成功步」）。另有一条只在仓储层成立——`close_step` 的 exists 守卫让「已在飞的那次调用回来了」也落不进终态之后的记录，否则 cancelled 的 run 里会挂着一条完整成功的 assistant 步。改坏验证：去掉该守卫 → 那条测试红"
+
+[[tool.agentworkbench.verification]]
+id = "A-V4"
+req = "REQ-13"
+invariant = "对"
+claim = "终态只写一次：第二次 finish 抛错，先前的终态必须留下"
+negative = "用「覆盖成最后一次」的写法 → 断言红（先前终态不许被冲掉）"
+status = "pass"
+tests = [
+    "tests/invariants/test_run_state.py::test_self_transition_is_illegal",
+    "tests/invariants/test_run_state.py::test_every_status_has_transition_row",
+    "tests/invariants/test_recorder.py::test_second_finish_raises_and_keeps_the_first_terminal",
+    "tests/invariants/test_recorder.py::test_storage_layer_holds_even_if_the_app_check_is_bypassed",
+]
+evidence = "2026-11-02。两次收口：第二次抛 IllegalTransition，库里 status/reason/finished_at 全是第一次那个值。**这条改坏验证抓出了一个真问题**：只测 `recorder.finish` 时，把 `close_run` 的 `and status = 'running'` 去掉依然全绿——因为应用层的 require_transition 先挡住了。也就是说原测试只证明了「同一对象重复调用被拒」，没证明「库里只可能有一个终态」。补了仓储层直调那条：绕过写入口连写两次，第二次返回 False 且行未变。并发/多进程各查各的都会看到 running，只有 SQL 的 where 能挡住后者"
+
+[[tool.agentworkbench.verification]]
+id = "A-V5"
+req = "REQ-11"
+invariant = "有"
+claim = "子进程里 kill 掉后，库里有一行 running（归属与输入都在）"
+negative = "注释掉「先写 running」那一步 → 库里无行 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_run_survives_kill.py::test_killed_process_leaves_a_running_row_behind",
+    "tests/invariants/test_run_survives_kill.py::test_without_the_first_write_the_kill_leaves_nothing",
+]
+evidence = "2026-11-02 真实强杀：子进程 `Recorder.start()` 后打印 READY，父进程 TerminateProcess/SIGKILL，再打开库——一行 `running`，归属（user/tenant/question）齐全，finished_at 为 NULL。负控同构：跳过 start 再杀 → 0 行，证明那行不是连接或建表的副产品。改坏验证：去掉 start 里的 commit() → 行留在未提交事务里，进程一死就没了，第一条当场红（0 行）。即「写了但没提交」与「根本没写」对用户是同一件事"
+
+[[tool.agentworkbench.verification]]
+id = "A-V6"
+req = "REQ-16"
+invariant = "对"
+claim = "假模型客户端阻塞中发停止 → 终态 cancelled，且「已发出未返回」那一步在库里"
+negative = "把「收到请求」直接写成终态 → 步骤少一条 → 红"
+status = "partial"
+remaining = "写入口的两段写已就绪，并能验「停止落在等返回那一段」：步骤行在调用发出前就写下去，run 收口后迟到的结果一律被 close_step 丢弃（output 保持 NULL），这条已全绿。仍差的是一整条链路——runner.ask 是同步函数、没有取消点，run 也没有 stop 语义；要取消信号能传到阻塞中的客户端调用，才能造「发停止 → 终态 cancelled 且那一步在库里」。C# 的依据（§1.5 第三条）：hub 补发的终态是界面，不是库里那一行"
+
+[[tool.agentworkbench.verification]]
+id = "A-V7"
+req = "REQ-12"
+invariant = "全"
+claim = "步骤数 == 假客户端的实际调用数（判不足的 run 里一条 assistant 步都没有）"
+negative = "判定不足的 run 里出现 assistant 步（模型根本没被调用过）→ 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_agent_pipeline.py::test_step_kinds_are_only_retrieval_and_assistant",
+    "tests/invariants/test_agent_pipeline.py::test_refused_run_has_no_assistant_step",
+    "tests/invariants/test_recorder.py::test_step_row_exists_while_the_call_is_still_in_flight",
+    "tests/invariants/test_recorder.py::test_seq_is_assigned_by_the_writer_and_increases",
+]
+evidence = "2026-11-02，runner 已接 recorder。可答路径步骤种类恰好 ['retrieval','assistant'] 且 assistant 步数 == 假 chat 的实际调用次数；判不足路径只有 ['retrieval']、chat 调用 0 次（这正是 negative 原文「判不足的 run 里出现 assistant 步」的反面）。判定与引用校验各只做了一次计算，没有调用任何外部东西，所以不成步。改坏验证：给任一处加一个 step → 种类断言红"
+
+[[tool.agentworkbench.verification]]
+id = "A-V8"
+req = "REQ-11"
+invariant = "有"
+claim = "run.user_id / tenant_id == 调用者，两列非空"
+negative = "换调用者 → 行必须跟着换；写死常量 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_agent_runs_schema.py::test_owner_columns_are_not_null",
+    "tests/invariants/test_recorder.py::test_owner_columns_follow_the_caller",
+    "tests/invariants/test_agent_pipeline.py::test_answered_run_lands_complete",
+]
+evidence = "2026-11-02。两半都验了：库层两列 NOT NULL；换调用者行跟着换（alice/team-a 与 bob/team-b 各起一条，归属不同）。原先以为这条要等 F1，是弄错了——F1 解决的是「user_id 从哪来」（登录态），不是「列会不会跟随」。写死成配置里的 `default` 会让第二条红，而那正是最省事的实现方式。接入登录态时只需改装配处传真实身份，recorder 不用动"
+
+[[tool.agentworkbench.verification]]
+id = "A-V9"
+req = "REQ-13"
+invariant = "对"
+claim = "不传 status → 写库报错（不得落成任何终态）"
+negative = "给 status 列加回默认 'succeeded' → 断言红"
+status = "pass"
+tests = [
+    "tests/invariants/test_agent_runs_schema.py::test_status_has_no_default_value",
+    "tests/invariants/test_agent_runs_schema.py::test_insert_without_status_is_rejected",
+    "tests/invariants/test_agent_runs_schema.py::test_every_run_status_is_accepted",
+    "tests/invariants/test_agent_runs_schema.py::test_unknown_status_is_rejected",
+]
+evidence = "库层已立（2026-11-02）：status 无默认值 + CHECK 限六值，不传即 IntegrityError，未知值也拒绝。改坏验证：加回 DEFAULT 'succeeded' → 两条同时红。CHECK 的值集由 core.runs.RunStatus 生成，DDL 里不另抄一份枚举"
+
+[[tool.agentworkbench.verification]]
+id = "A-V10"
+req = "REQ-12"
+invariant = "全"
+claim = "供应商不回 usage → token 字段为 NULL；没走到收口的 run 耗时为 NULL（两者都不是 0）"
+negative = "写成 0 → 红（0 会被当成真实值参与成本统计）"
+status = "pass"
+tests = [
+    "tests/invariants/test_agent_runs_schema.py::test_token_and_duration_columns_accept_null",
+    "tests/invariants/test_recorder.py::test_missing_usage_is_null_not_zero",
+    "tests/invariants/test_recorder.py::test_reported_usage_is_stored_as_reported",
+    "tests/invariants/test_recorder.py::test_usage_absent_from_one_side_does_not_zero_the_other",
+    "tests/invariants/test_llm_usage.py::test_absent_usage_field_stays_none",
+    "tests/invariants/test_llm_usage.py::test_genuine_zero_is_kept_as_zero",
+    "tests/invariants/test_llm_usage.py::test_no_usage_object_means_empty_not_zeroes",
+    "tests/invariants/test_agent_pipeline.py::test_missing_usage_lands_as_null_end_to_end",
+    "tests/invariants/test_agent_pipeline.py::test_reported_usage_is_stored_on_both_rows",
+]
+evidence = "2026-11-02 端到端通了。上游源头修掉：client 原先 `usage.prompt_tokens or 0`，供应商回 null 时变成 0，而 0 是可信的「用了零个 token」——改成原样保留 None，空 dict 表示整次无 usage（三态：无对象 / 字段 None / 真 0）。写入口缺值写 NULL。端到端：假 chat 没有 last_usage → run 与 step 的 token 都是 NULL；MeteredChat 回 1200/40 → 两行都落库。改坏验证：`prompt_tokens or 0` → 两条红"
+
+[[tool.agentworkbench.verification]]
+id = "A-V11"
+req = "REQ-11"
+invariant = "有"
+claim = "注入 DB 写失败 → 该次回答返回错误，或显式标为不可审计"
+negative = "except 之后照常返回成功 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_recorder.py::test_write_failure_raises_instead_of_logging",
+    "tests/invariants/test_recorder.py::test_step_write_failure_also_raises",
+    "tests/invariants/test_recorder.py::test_completion_write_failure_raises",
+    "tests/invariants/test_agent_pipeline.py::test_recording_failure_aborts_the_answer",
+]
+evidence = "2026-11-02，两半都通。写入口：三处写入（起 run / 加步骤 / 写终态）在库不可写时都抛 RecordingFailed，不 catch、不 LogWarning。编排层：库设 query_only 后调 ask → 抛 RecordingFailed，**AskResult 根本不会构造出来**，调用方拿不到答案。这正是 §三 那条硬规则——「记录写不进去」不是「日志没打上」，是这次回答不该被当成成功。C# 的对照在 `AgentHarnessService.cs:430`：catch 之后 LogWarning，用户照拿答案。端点层的错误码（目前会是 500）等 ask 端点建起来一并配"
+
+[[tool.agentworkbench.verification]]
+id = "A-H1"
+req = "REQ-12"
+invariant = "全"
+claim = "取一次真实 run 的模型名与 token，去供应商后台核，对得上"
+negative = "手动把 token 改大 10% → 核对必须发现不一致；发现不了说明这个人工资项没有判据"
+status = "manual"
+evidence = "未验。zhipu glm-4-flash 已真调通（1516 prompt tokens 进 prompt）。链路现在通了：client 原样保存供应商回的 usage，runner 落 run 与 assistant 步各一份 token。**只差真跑一轮**——ask 端点还没建，没有从接口触发一条真实 run 的路径。端点建好后跑一次，拿库里的 model + prompt_tokens 去智谱后台对账即可"
+
+[[tool.agentworkbench.verification]]
+id = "A-H2"
+req = "REQ-12"
+invariant = "全"
+claim = "直接查步骤表：错误字段非空的就是失败步，不靠界面"
+negative = "把错误写进结果文本、错误字段留空 → 直接查库就分不出成败，人工项判不成立"
+status = "manual"
+tests = [
+    "tests/invariants/test_agent_runs_schema.py::test_error_column_is_separate_from_output",
+    "tests/invariants/test_recorder.py::test_failed_step_keeps_error_separate_and_re_raises",
+]
+evidence = "机制已建并可自动验（2026-11-02）：`error` 独立成列，测试验过「error 有值、output 为 NULL」可共存；recorder 在调用抛异常时写 `TimeoutError: model timeout` 到 error、output 留空，**并把原始异常继续抛出**（吞掉等于让上层以为调用成功）。剩下的人工部分是「一条真实失败运行进库后能一眼认出」——要有真跑过的一次失败，等 ask 端点接入"
+
+# ─────────────────────────────────────────────────────────────
+# F5 会话与记录：不变量与验证的唯一登记处（文档只写功能）
+#
+# 不变量四条：存（三块一起落库）/ 同（换设备逐字段相同）/
+# 隔（他人会话连存在都不可推断）/ 清（删会话删干净）。全 15 条，2 条人工。
+#
+# 现状（2026-11-03 15:45）：三张表 + 仓储 + 写入口 + 轨迹读侧 + 端点 + 前端都在。
+# 这一轮补四件：删除的对外入口（C-V12）、拒答在历史里的标记（C-V13）、
+# 占位行（C-V11 的崩溃边）、轨迹渲染的前端断言（C-V5）。
+# remaining 写的是「差哪一格」，不是「以后再说」。
+#
+# 编号即契约：C-V* 只在这一次登记。文档不再抄一份判据；
+# 闸门会拦住条目增减与改名，以及「标了 pass 却没有测试撑着」。
+
+[[tool.agentworkbench.verification]]
+id = "C-V1"
+req = "REQ-04"
+invariant = "隔"
+claim = "会话列表只含自己的：过滤在 SQL 里（不是查全部再过滤），排序 updated_at DESC, id DESC"
+negative = "库里插一条他人的会话 → A 的条数、首条时间、顺序都不变；用他人 id 取消息，响应与「不存在的 id」逐字段相同（404）。精确化（2026-11-03，S-V4 加了 request_id）：比较前剥掉 request_id——它是每请求随机的 uuid，与资源存在性无关；排除随机字段后的逐字段相同，说明其余字段不携带任何可用于区分的信息，判据强度不变"
+tests = [
+    "tests/invariants/test_conversations_schema.py::test_owner_columns_are_not_null",
+    "tests/invariants/test_conversations_repo.py::test_list_contains_only_my_conversations",
+    "tests/invariants/test_conversations_repo.py::test_another_owner_writing_does_not_change_my_list",
+    "tests/invariants/test_conversations_repo.py::test_foreign_tenant_with_the_same_user_name_is_not_mine",
+    "tests/invariants/test_conversations_repo.py::test_order_breaks_ties_by_id",
+    "tests/invariants/test_conversations_repo.py::test_foreign_id_looks_exactly_like_a_missing_id",
+    "tests/invariants/test_conversations_repo.py::test_insert_message_refuses_a_foreign_conversation",
+    "tests/invariants/test_conversations_repo.py::test_touch_cannot_move_someone_elses_conversation",
+    # 端点层：列表、排序，以及「越权 404 与不存在 404 逐字节相同」
+    "tests/invariants/test_conversations_endpoint.py::test_list_is_a_bare_camel_case_array",
+    "tests/invariants/test_conversations_endpoint.py::test_list_never_shows_another_users_conversation",
+    "tests/invariants/test_conversations_endpoint.py::test_missing_and_foreign_conversations_answer_byte_identically",
+    "tests/invariants/test_conversations_endpoint.py::test_list_order_is_stable_when_two_conversations_share_a_second",
+    "tests/invariants/test_conversations_endpoint.py::test_trace_of_a_foreign_run_is_byte_identical_to_missing",
+]
+status = "pass"
+
+[[tool.agentworkbench.verification]]
+id = "C-V2"
+req = "REQ-04"
+invariant = "存"
+claim = "续聊落在同一条会话：追问后 conversations 行数不变、messages +2、updated_at 前进"
+negative = "传他人的 conversationId → 为他新建一条新会话，他人的会话 messages 行数不变（不报错、不复用）"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversation_writer.py::test_first_question_creates_a_conversation_named_after_it",
+    "tests/invariants/test_conversation_writer.py::test_second_question_lands_in_the_same_conversation",
+    "tests/invariants/test_conversation_writer.py::test_a_foreign_conversation_id_starts_a_new_one",
+    "tests/invariants/test_conversation_writer.py::test_conversation_is_not_created_when_its_first_message_cannot_be_written",
+    # 端点层：走 HTTP 追问同一个 id，会话数不变、消息 +2、标题不动
+    "tests/invariants/test_ask_endpoint.py::test_follow_up_with_the_same_id_stays_in_the_same_conversation",
+    "tests/invariants/test_ask_endpoint.py::test_a_foreign_conversation_id_starts_a_new_one_instead_of_failing",
+]
+evidence = "2026-11-03：`chat.start_turn` 一个事务里定位/新建会话 + 落用户消息 + 推 updated_at，他人 id 走「查不到」那条路新建。改坏验证：去掉事务 → 新建出的会话在消息写失败后仍留着，红；复用路径重写标题 → 红"
+
+[[tool.agentworkbench.verification]]
+id = "C-V3"
+req = "REQ-21"
+invariant = "存"
+claim = "答案与引用快照重开仍在，且快照自包含：文件名 / 片段序号 / 原文 120 字 / 当时校验标记"
+negative = "把 chunks.content 全换成哨兵串后重开 → 历史引用照旧、哨兵零出现（回表查即红）"
+procedure = """① 问答一次，记下四条引用的文件名 / 片段序号 / 卡片原文 / 有无警告；
+② 换全新 cookie jar 重开同一会话，正文逐字相同；
+③ 展开引用：四字段与①逐字相同，校验标记也相同；
+④ 把 chunks.content 全换成哨兵串后刷新：历史引用不变、哨兵零出现。"""
+status = "partial"
+tests = [
+    "tests/invariants/test_conversations_schema.py::test_snapshot_has_no_pointer_columns",
+    "tests/invariants/test_conversations_schema.py::test_snapshot_requires_the_four_judged_fields",
+    "tests/invariants/test_conversations_schema.py::test_snapshot_check_values_are_limited_to_the_enums",
+    "tests/invariants/test_conversations_schema.py::test_citation_number_is_unique_within_a_message",
+    "tests/invariants/test_conversation_writer.py::test_answer_and_its_citations_land_together_or_not_at_all",
+    "tests/invariants/test_conversation_writer.py::test_excerpt_is_cut_to_the_length_the_interface_shows",
+    "tests/invariants/test_conversation_writer.py::test_out_of_range_citation_leaves_no_card",
+    "tests/invariants/test_conversation_writer.py::test_two_sentences_citing_the_same_block_make_one_card_with_the_worst_verdict",
+    "tests/invariants/test_conversation_writer.py::test_missing_threshold_is_stored_as_unverified_not_supported",
+    "tests/invariants/test_conversation_writer.py::test_refusal_is_stored_with_its_text_and_no_cards",
+    # 端点层：一个 chunk 都没建过，出处四字段照样给得出来（回表 join 就会空）
+    "tests/invariants/test_conversations_endpoint.py::test_citations_come_from_the_snapshot_not_the_index",
+    # 端到端：真实问一次，再从历史接口读回引用（不经过任何写入函数的直接调用）
+    "tests/invariants/test_ask_endpoint.py::test_the_answer_carries_its_citations_into_history",
+]
+remaining = "写入口与读侧都通了：快照按原样复制（不重算）、四字段齐全、120 字与界面同数、与正文同一事务（引用写失败时正文一起回滚）。**仍差一条端到端**：真机重建索引后重开历史，引用必须不变——它需要 F2 的重建流程；自动化版的哨兵实验在 schema 层只能证明「没有指针列」，证明不了「重建后真的没变」。**另一个缺口已结案**：拒答在历史里没有标记（2026-11-03 前端接入时发现）——已单独立成 C-V13 并关闭：标记不写进 `messages`，由消息端点按 `run_id` 带出那次运行的终态与原因"
+
+[[tool.agentworkbench.verification]]
+id = "C-V4"
+req = "REQ-21"
+invariant = "存"
+claim = "每条 assistant 行能定位到唯一一次 run，且该 run 的步骤序列与当时一致（失败那一轮也有挂点）"
+negative = "run_id 置空或指向另一条会话的 run → 写入或读取必须拒绝，不得静默返回别的 run"
+procedure = """同一会话问 5 次，其中 2 次让模型端点在请求阶段就失败（零 token）：
+5 行 run、5 条 assistant 行（3 条有正文、2 条空）；逐条按 run_id 断言唯一，不按顺序猜。"""
+tests = [
+    "tests/invariants/test_conversations_schema.py::test_assistant_message_requires_a_run",
+    "tests/invariants/test_conversations_schema.py::test_user_message_must_not_carry_a_run",
+    "tests/invariants/test_conversations_schema.py::test_one_run_belongs_to_exactly_one_answer",
+    "tests/invariants/test_conversation_writer.py::test_answer_row_points_at_its_run",
+    "tests/invariants/test_conversation_writer.py::test_answer_cannot_point_at_someone_elses_run",
+    "tests/invariants/test_conversation_writer.py::test_empty_answer_still_leaves_a_row",
+    "tests/invariants/test_trace_reader.py::test_steps_come_back_in_seq_order_even_if_inserted_out_of_order",
+    # 端点层：三段串成一条链，失败那一轮也有挂点
+    "tests/invariants/test_conversations_endpoint.py::test_answer_to_run_to_trace_is_one_chain",
+    "tests/invariants/test_conversations_endpoint.py::test_failed_round_still_has_an_answer_row",
+    "tests/invariants/test_conversations_endpoint.py::test_user_message_never_carries_a_run",
+    # 端到端：一次真实作答 = 两条消息 + 一条回答带 run；失败那一轮也有挂点
+    "tests/invariants/test_ask_endpoint.py::test_one_turn_leaves_a_question_and_an_answer_pointing_at_its_run",
+    "tests/invariants/test_ask_endpoint.py::test_failed_model_still_leaves_an_answer_row",
+]
+status = "pass"
+
+[[tool.agentworkbench.verification]]
+id = "C-V5"
+req = "REQ-14"
+invariant = "同"
+claim = "历史轨迹显示完整步骤：迭代、工具、参数、返回、耗时、终态与原因，失败步骤必须出现"
+negative = "把当次推送用的 600 字预览存起来当历史 → 必须红（它是摘要，不是记录）；渲染层把失败步与未返回步合成一句 → 必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_trace_reader.py::test_steps_come_back_in_seq_order_even_if_inserted_out_of_order",
+    "tests/invariants/test_trace_reader.py::test_long_output_is_not_truncated",
+    "tests/invariants/test_trace_reader.py::test_in_flight_step_is_marked_as_not_finished",
+    "tests/invariants/test_trace_reader.py::test_failed_step_keeps_its_error_and_is_not_in_flight",
+    "tests/invariants/test_trace_reader.py::test_foreign_run_is_indistinguishable_from_a_missing_one",
+    "tests/invariants/test_trace_reader.py::test_foreign_steps_are_not_reachable_by_run_id",
+    # 端点层：交给界面的那份也不截断、也不把 None 补 0
+    "tests/invariants/test_conversations_endpoint.py::test_trace_returns_steps_in_seq_order",
+    "tests/invariants/test_conversations_endpoint.py::test_long_output_is_returned_in_full",
+    "tests/invariants/test_conversations_endpoint.py::test_citation_counts_are_null_not_zero_when_there_was_no_answer",
+    "tests/invariants/test_conversations_endpoint.py::test_in_flight_step_is_flagged_apart_from_empty_output",
+    # 渲染层（vitest + @vue/test-utils）：读侧对不等于界面上看得出。
+    # 这几条钉的是"每一格画出来是什么"，不是"数据对不对"——两条判据缺一不可
+    "web/tests/run-trace.spec.ts::test_every_step_is_rendered_in_order",
+    "web/tests/run-trace.spec.ts::test_failed_step_shows_error_instead_of_result",
+    "web/tests/run-trace.spec.ts::test_in_flight_step_reads_as_no_return_not_empty",
+    "web/tests/run-trace.spec.ts::test_pipeline_does_not_say_n_rounds",
+    "web/tests/run-trace.spec.ts::test_refused_run_is_labelled_as_refusal",
+]
+evidence = "三段都验（2026-11-03）。读侧：步骤按 seq 返回、长输出不截断、in-flight 与「返回了空」分开（6 条）。端点层：交给界面的那份原样给、拒答的引用计数是 null 不是 0（4 条）。**渲染层这轮补上了自动化**：vitest + @vue/test-utils mount `RunTrace.vue`，断言 5 条——步骤按序渲染、失败步显示异常而不是返回、未返回步写成「发出后没有返回」、四段流水线不出现「第 N 轮」、refused 显示为拒答而不是原样吐状态码。改坏验证：把 `s.error ?? (s.inFlight ? ...)` 这行的 inFlight 分支删掉 → 第 3 条红；把 `pipeline` 判断改成恒 false → 第 4 条红；STATUS 表删掉 refused → 第 5 条红"
+
+[[tool.agentworkbench.verification]]
+id = "C-V6"
+req = "REQ-14"
+invariant = "同"
+claim = "轨迹只读快照：同一会话连开两次，轨迹 JSON 逐字节相同（不含 request_id——那本来就是每请求随机值）"
+negative = "改模型 / 改提示词 / 改阈值后重开 → 历史轨迹不得变化（重算即红）"
+status = "pass"
+tests = [
+    "tests/invariants/test_trace_reader.py::test_reading_twice_returns_byte_identical_json",
+    "tests/invariants/test_trace_reader.py::test_history_does_not_change_when_the_knowledge_tables_change",
+    "tests/invariants/test_trace_reader.py::test_reader_does_not_import_the_pipeline",
+    "tests/invariants/test_trace_reader.py::test_the_import_scanner_sees_the_repository",
+]
+evidence = "2026-11-03：`trace.reader` 只 import core 与 run 仓储——拿不到检索/判定/校验，「顺手重算」在结构上不成立（有 AST 扫描守着，附自检防扫描器失灵）。连读两次 JSON 逐字节相同；改知识库后重读一个字都不变。改坏验证：截断长返回 → 红；NULL 计数补 0 → 红；读侧 import 校验模块 → 红"
+
+[[tool.agentworkbench.verification]]
+id = "C-V7"
+req = "REQ-04"
+invariant = "同"
+claim = "换设备：两个独立 cookie jar、不同 UA、同账号，四个观察点（会话 / 答案 / 依据 / 过程）逐字段相同"
+negative = "只靠前端 localStorage 恢复 → 必须红（新 jar 没有 localStorage）"
+procedure = """A 登录→提问→记下四个观察点的完整响应；B（独立 cookie jar、不同 UA、先清本地存储）
+登录同账号，比对列表 / 标题 / 顺序 / 答案 / 引用 / 轨迹，逐字段相同才算过。"""
+status = "partial"
+remaining = "无端点无前端接线，且受 F1 阻塞：接口层只有一个用户（caller_of 返回常量），跨账号部分只能先在仓储层用两个 owner 验；换设备的端到端要等 F1 有真登录态"
+
+[[tool.agentworkbench.verification]]
+id = "C-V8"
+req = "REQ-21"
+invariant = "清"
+claim = "删会话五处一起消失：messages、引用快照、agent_runs、agent_steps、会话本身；日志留一行但不含内容"
+negative = "只删 messages 而 run 仍在 → 红；删 A 的会话后 B 的任何表计数变化 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversations_schema.py::test_deleting_a_conversation_takes_messages_and_citations",
+    "tests/invariants/test_conversations_schema.py::test_deleting_a_run_that_an_answer_points_at_is_refused",
+    "tests/invariants/test_conversations_repo.py::test_delete_removes_messages_citations_runs_and_steps",
+    "tests/invariants/test_conversations_repo.py::test_delete_still_cleans_up_when_foreign_keys_are_off",
+    "tests/invariants/test_conversations_repo.py::test_delete_by_a_foreign_owner_deletes_nothing",
+    "tests/invariants/test_conversations_repo.py::test_delete_reports_how_many_messages_it_took",
+    "tests/invariants/test_conversation_writer.py::test_delete_logs_one_line_without_content",
+    "tests/invariants/test_conversation_writer.py::test_delete_of_a_foreign_conversation_logs_nothing",
+    "tests/invariants/test_conversation_writer.py::test_delete_is_all_or_nothing",
+]
+evidence = "2026-11-03：`chat.delete_conversation` 一个事务删五处，日志在**提交之后**写（提交前写会让失败的事务也留一条「已删除」），只含会话 id / 归属 / 条数 / 时间。改坏验证：去掉事务 → 触发器让删 run 失败后消息已删、run 还在，红；不删 steps / 不删 citations → 红（那两条用关掉外键开关的用例才拦得住）；删别人的会话仍写日志 → 红。**已知边**：崩溃在写回答之前的 run 没有 messages 边，本域够不着，见 C-V11"
+
+[[tool.agentworkbench.verification]]
+id = "C-V9"
+req = "REQ-04"
+invariant = "同"
+claim = "标题跨设备一致：首条问题前 18 字，写一次之后不再变"
+negative = "标题恒为「新会话」（现状）→ 红；把派生留在前端内存 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversations_schema.py::test_title_is_required",
+    "tests/invariants/test_conversations_repo.py::test_title_is_the_first_18_chars_with_whitespace_collapsed",
+    "tests/invariants/test_conversations_repo.py::test_empty_question_has_no_title",
+    "tests/invariants/test_conversations_repo.py::test_touch_moves_time_but_never_the_title",
+    "tests/invariants/test_conversation_writer.py::test_first_question_creates_a_conversation_named_after_it",
+    "tests/invariants/test_conversation_writer.py::test_follow_up_never_rewrites_the_title",
+    # 端点层：列表里读回来的标题就是当时写的那一个
+    "tests/invariants/test_ask_endpoint.py::test_first_ask_opens_a_conversation_named_after_the_question",
+]
+evidence = "2026-11-03：标题在建会话那一次由 `derive_title(question)` 写定，入库后**没有任何写入路径会再碰它**（`touch` 只动 updated_at，复用路径不写 title）。端到端也通了：`POST /ask` 建出来的会话，`GET /conversations` 读回的标题就是问题前 18 字，追问后不变。两台设备读到的是同一行，所以一致不再依赖任何本地状态"
+
+[[tool.agentworkbench.verification]]
+id = "C-V10"
+req = "REQ-04"
+invariant = "隔"
+claim = "存在性不可推断：他人新建会话后，A 的列表总数、首末时间、顺序都不变"
+negative = "用未过滤的 COUNT(*) / MAX(updated_at) 实现分页或摘要 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversations_schema.py::test_owner_columns_are_not_null",
+    "tests/invariants/test_conversations_repo.py::test_count_is_filtered_not_global",
+    "tests/invariants/test_conversations_repo.py::test_another_owner_writing_does_not_change_my_list",
+    "tests/invariants/test_conversations_repo.py::test_order_breaks_ties_by_id",
+]
+evidence = "2026-11-03：`count_for_owner` 与 `list_for_owner` 的过滤都在 SQL 里，索引 (tenant_id, user_id, updated_at DESC, id DESC) 直接命中。改坏验证：把 count 改成全表 `select count(*) from conversations` → 红。这条不需要端点——泄漏发生在数字本身，不在传输层"
+
+[[tool.agentworkbench.verification]]
+id = "C-V11"
+req = "REQ-21"
+invariant = "存"
+claim = "每条 run 在开始时就落到一条会话上：那一行在作答结束前已经存在，id 等于 assistant 行上的 run_id；进程在写正文前被杀也不留孤儿"
+negative = "只在作答结束时才写行 → 模拟进程被杀（run 停在 running、消息 0 行）→ 红；占位与补全各插一行 → 唯一索引撞车或两条回答，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversation_writer.py::test_answer_row_points_at_its_run",
+    "tests/invariants/test_conversation_writer.py::test_answer_cannot_point_at_someone_elses_run",
+    # 两段写：先占位（正文空），再在原行上补全——不是插第二行
+    "tests/invariants/test_conversation_writer.py::test_placeholder_row_exists_before_the_answer_is_known",
+    "tests/invariants/test_conversation_writer.py::test_placeholder_is_completed_in_place_not_duplicated",
+    # 端到端：两次问答 → 按会话列出两条回答 → 各自的 runId 都能展开轨迹
+    "tests/invariants/test_ask_endpoint.py::test_every_answer_can_be_traced_back_to_its_run",
+    "tests/invariants/test_ask_endpoint.py::test_failed_model_still_leaves_an_answer_row",
+    # 崩溃边：run 起来之后、正文写下去之前被杀，那一行仍在，且指向停在 running 的 run
+    "tests/invariants/test_ask_endpoint.py::test_run_killed_before_the_answer_still_leaves_a_row",
+]
+evidence = "**边仍是单边：`messages.run_id`，不给 `agent_runs` 加 `conversation_id`**（两条边会互相矛盾且发现不了）。2026-11-03 补上崩溃边：作答改成两段写——`recorder.start` 之后立刻 `begin_answer` 插一行空正文（正文 ''、run_id 指向它），跑完由 `complete_answer` 在原行上 UPDATE 正文并插引用快照。改坏验证：把占位放回「跑完才写」 → 杀掉进程的用例里消息 0 行、run 停在 running，红；把补全改成再 insert 一次 → `ux_messages_run` 唯一索引当场冲突，红；把补全的 UPDATE 条件去掉 owner → 别人的行被改写，红"
+
+[[tool.agentworkbench.verification]]
+id = "C-V12"
+req = "REQ-21"
+invariant = "清"
+claim = "删除是对外可用的动作：一次 DELETE 之后列表少一条、消息与轨迹都取不到；对同一个 id 再删一次，响应与「从未存在过的 id」逐字段相同（404；比较剥掉每请求随机的 request_id，理由同 C-V1）"
+negative = "只有仓储层的删除、没有对外入口（2026-11-03 之前的现状）→ 红：界面按钮每次必失败，而删除逻辑「明明测过了」；删别人的会话返回成功 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversations_endpoint.py::test_delete_removes_the_conversation_from_the_list",
+    "tests/invariants/test_conversations_endpoint.py::test_delete_makes_messages_and_trace_unreachable",
+    "tests/invariants/test_conversations_endpoint.py::test_deleting_twice_is_indistinguishable_from_never_existing",
+    "tests/invariants/test_conversations_endpoint.py::test_deleting_someone_elses_conversation_leaves_it_intact",
+]
+evidence = "2026-11-03：`DELETE /api/conversations/{id}` 接上，一条路由三行——`chat.delete_conversation` 返回布尔，False 一律 `not_found(CONVERSATION_MISSING)`，与 GET 的 404 同一句话、不回显 id。`declarations.py` 登记为「删除」而不是漏登记。改坏验证：把 False 分支改成 204 → 「删别人的会话」那条红（B 的计数变了）；把删两次的 404 改成 500 → 「逐字节相同」那条红；把路由从 declarations 摘掉 → 入口声明自检红"
+
+[[tool.agentworkbench.verification]]
+id = "C-V13"
+req = "REQ-21"
+invariant = "同"
+claim = "重开历史后，当时拒答的那条仍然是拒答：标为拒答、理由与当时相同、正文一字不变"
+negative = "只按「正文等于那句拒答文案」来判定 → 改文案后所有历史拒答一起变成普通回答，红；按当前阈值重新判一遍 → 改阈值后历史改口，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversations_endpoint.py::test_refused_answer_is_marked_in_history",
+    "tests/invariants/test_conversations_endpoint.py::test_answered_message_is_not_marked_as_refused",
+    "tests/invariants/test_ask_endpoint.py::test_refusal_survives_a_reopen_with_the_same_reason",
+]
+evidence = "2026-11-03：标记不复制进 `messages`，而是读消息时按 `run_id` 取那次运行的 `status` 与 `reason` 原样带出（`runStatus` / `runReason`）——唯一来源仍是 `agent_runs`，不存在两份会分叉的副本。前端在 `selectConversation` 里按 `runStatus === 'refused'` 恢复拒答卡片，正文直接用库里那份。改坏验证：端点不带 runStatus → 两条红；前端改成在展示层按理由重新判 → 拒绝（改阈值后历史改口）；只按正文文案比对 → 把拒答文案改一个字，历史那条立刻变普通回答，红"
+
+[[tool.agentworkbench.verification]]
+id = "C-H1"
+req = "REQ-04"
+invariant = "同"
+claim = "真机换设备：两台物理设备或两个浏览器 profile，肉眼走一遍四个观察点"
+negative = "肉眼发现任一观察点不同 → 自动化那条（C-V7）的字段比对漏了东西，回头补断言"
+status = "manual"
+evidence = "未验：需要两台设备 / 两个 profile。自动化只能证明「字段相同」，证明不了「人看起来一样」。失效条件：F1 上线后才有真登录态，两个 profile 才能各登录一次"
+
+[[tool.agentworkbench.verification]]
+id = "C-H2"
+req = "REQ-21"
+invariant = "存"
+claim = "索引真的重建一次之后，历史引用仍在（原文、文件名、片段序号、校验标记都不变）"
+negative = "重建后历史引用变空或指向别的内容 → 快照不是自包含的，只是当时恰好对得上"
+status = "manual"
+evidence = "未验：需要 F2 的重建流程 + 一次真实问答。它抓的是「重建后引用还在不在」这一整类问题，自动化版本（C-V3 第 4 步用哨兵串）只能模拟不能替代。失效条件：F2 的重建端点被移除"
+
+# ─────────────────────────────────────────────────────────────
+# F6 服务端能力：不变量与验证的唯一登记处（S- = Server）
+#
+# 文档 §四 的 V-1~V-10 与 F2 撞号，登记处换前缀。五条不变量对应五条 REQ：
+# 通（REQ-17 只经 HTTP 可走完）/ 查（REQ-18 按 id 可查）/
+# 离（REQ-19 断连不丢任务）/ 稳（REQ-20 错误稳定不泄露）/
+# 一（REQ-22 模型配置平台级全局唯一）。
+#
+# 现状（2026-11-03 立项时）：REQ-20 的码表与 handler 已有（F4 顺带立的地基），
+# REQ-22 的解析面已有但**存储面整块缺失**（providers 两张表不存在），
+# REQ-18/19 只有轨迹读侧的一半，REQ-17 无脚本。
+# ─────────────────────────────────────────────────────────────
+
+[[tool.agentworkbench.verification]]
+id = "S-V1"
+req = "REQ-17"
+invariant = "通"
+claim = "核心能力只经 HTTP 可走完：上传 → 提问 → 取引用 → 查运行 → 查历史，一个脚本全程不开浏览器"
+negative = "脚本里出现任何前端 / WebSocket / SignalR 请求 → 红；去掉凭据仍能走通 → 红（说明存在绕过登录态的后门）"
+status = "partial"
+tests = [
+    "tests/invariants/test_smoke_flow.py::test_http_alone_completes_the_loop",
+]
+remaining = "五步已可自动跑（httpx ASGITransport，test_smoke_flow.py），scripts/smoke.py 是给人手跑的同一份流程。**登录步卡 F1**：判据原文含「登录 → 」，F1 没有登录端点时这一步只能注释掉。接入 F1 后补第七步并把状态升 pass"
+
+[[tool.agentworkbench.verification]]
+id = "S-V2"
+req = "REQ-18"
+invariant = "查"
+claim = "给定 run id 查得到状态机的当前态与已落库结果；查别人的 run 与查不存在的 run，响应逐字段相同（404；比较剥掉每请求随机的 request_id，理由同 C-V1）"
+negative = "把别人的 run 状态返回出来 → 红；只存终态不存进行中（running 的 run 查不到）→ 红，REQ-19 的「当前态」就不可信"
+status = "pass"
+tests = [
+    "tests/invariants/test_runs_endpoint.py::test_run_is_readable_before_and_after_terminal",
+    "tests/invariants/test_runs_endpoint.py::test_foreign_run_is_byte_identical_to_missing",
+    "tests/invariants/test_runs_endpoint.py::test_saved_answer_is_readable_through_the_run",
+]
+evidence = "2026-11-03（格 3）。`GET /api/runs/{run_id}`：状态取 `trace.read_run`（与轨迹同一套归属判定，不会出现「状态查得到、轨迹查不到」的分裂）；**answer 从 messages 按 run_id 取回**——running 阶段是占位行的空串（「还没有」可见），终态后是当时的正文；没有挂点行（run 起来后、占位之前进程被杀）是 None。别人的 run 与不存在的 run 剥掉 request_id 后逐字段相同，id 也不回显。改坏验证：归属过滤换成别人的 id → 越权那条红；answer 改成恒 None → 终态可读两条红"
+
+[[tool.agentworkbench.verification]]
+id = "S-V3"
+req = "REQ-19"
+invariant = "离"
+claim = "提交（202）与执行分离：发起后立刻断开连接，任务仍跑到终态；重连查得到状态与结果"
+negative = "把执行的取消令牌绑到连接上（C# `AgentHub.RunAsync` 用 `CreateLinkedTokenSource(Context.ConnectionAborted)`，断开即取消整条 run——移植过来 V-3 必须红）；后台任务用裸 create_task 不持引用 → 被 GC 静默回收，任务无声消失"
+status = "pass"
+tests = [
+    "tests/invariants/test_runs_endpoint.py::test_submit_returns_202_before_the_answer_exists",
+    "tests/invariants/test_runs_endpoint.py::test_submitted_run_survives_the_client_leaving",
+    "tests/invariants/test_runs_endpoint.py::test_result_matches_an_inline_run",
+]
+evidence = "2026-11-03（格 3）。`POST /api/runs` → 202 {conversationId}。**①② 同步、③④ 异步**：模型解析与 start_turn 留在请求里（配置错误在 202 之前 503 一行不写；问题已落库，进程被杀也不丢），作答在守护线程——线程自开连接（WAL），不持有 Request / 连接对象；chat 客户端在请求线程构造好传入。线程集合强引用 + 跑完自摘（§4.2）。**202 没有 runId**：run 行在线程里才创建，客户端经消息列表的占位行（C-V11）发现 runId——不发明第四条发现路径。执行流与 ask 共用 `answer_flow.execute_turn`（不许第二个写入者）。假 chat 用 Event 阻塞断言「提交先于结果」；「断开」的 ASGI 等价形态 = 提交响应返回后客户端不再有任何行为，真实 socket 版归部署后人工（S-H1）。改坏验证：执行体不启动 → 存活与同构两条红；answer 不读库 → 两条红"
+
+[[tool.agentworkbench.verification]]
+id = "S-V4"
+req = "REQ-20"
+invariant = "稳"
+claim = "同一错误两次调用，code / http_status / retryable 完全一致，message 可改；错误体五字段（code、http_status、retryable、message、request_id）齐全"
+negative = "断言按文案比对 → 改一次文案全红；体里漏 request_id → 用户报错时运维无从查起，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_error_responses.py::test_same_error_twice_has_the_same_code_and_status",
+    "tests/invariants/test_error_responses.py::test_error_body_carries_a_request_id",
+    "tests/invariants/test_error_responses.py::test_response_header_matches_the_body_request_id",
+    "tests/invariants/test_error_responses.py::test_unexpected_errors_also_carry_the_request_id",
+    "tests/invariants/test_error_responses.py::test_two_requests_get_different_request_ids",
+]
+evidence = "2026-11-03：五字段信封在 `api.errors.body_of` 统一；`RequestContextMiddleware`（纯 ASGI，不用 BaseHTTPMiddleware——它会干扰将来的 SSE）给每个请求生成 uuid4 的 request_id，写进 scope.state、响应头 `X-Request-Id`。http_status 进 body 是刻意的：curl -i 之外的调用方拿不到状态行原始值，两处必须同值。**实现时踩到 Starlette 的洋葱层**：兜底 500 由最外层的 ServerErrorMiddleware 生成，响应不流经用户中间件的 send——头在 handler 里自己设、中间件只补缺，否则 500 恰好是唯一没头的响应。404（AppError 路径）与 500（兜底路径）各验一次。改坏验证：摘掉中间件 → request_id 两条红；500 的头写死 → 头与 body 同值那条红"
+
+[[tool.agentworkbench.verification]]
+id = "S-V5"
+req = "REQ-20"
+invariant = "稳"
+claim = "内部细节只进日志不进响应：异常对象里塞的哨兵串，日志里有、响应体里没有；三类（凭据 / 他人数据 / 内网地址）各验一条"
+negative = "把上游异常原文拼进用户可见文案（llm/client.py 曾把 `{exc}` 拼进 message）→ 红；兜底 handler 把堆栈回给客户端 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_error_responses.py::test_credential_sentinel_reaches_logs_not_response",
+    "tests/invariants/test_error_responses.py::test_foreign_data_sentinel_reaches_logs_not_response",
+    "tests/invariants/test_error_responses.py::test_internal_address_sentinel_reaches_logs_not_response",
+    "tests/invariants/test_llm_client.py::test_client_errors_do_not_echo_the_exception",
+]
+evidence = "2026-11-03。注入点走真实路径：monkeypatch chat_factory 抛 RuntimeError（消息含哨兵），ask 路由的兜底让它变成 500——比造一条测试专用路由真实（专用路由过不了 declarations 闸门）。**写测试当场抓到一个现存泄露**：llm/client.py 的 MODEL_UNAVAILABLE 分支把上游异常原文 `{exc}` 拼进用户可见 message（base_url / api_key 都可能在那里）——已改为固定文案 + `logger.exception` 把原文留给日志。兜底 handler 也补了 `logger.exception`：判据前半句「日志里有」此前根本无处可查"
+
+[[tool.agentworkbench.verification]]
+id = "S-V6"
+req = "REQ-22"
+invariant = "一"
+claim = "api_key 库内密文；加密密钥只来自环境变量（AWB_SECRET_KEY），缺密钥启动失败；明文不落库"
+negative = "直接 SQL select 能读出明文 → 红；不配 AWB_SECRET_KEY 仍能启动 → 红（静默用明文正是 C# M006 注释里「P2 再加密」的下场）"
+status = "pass"
+tests = [
+    "tests/invariants/test_provider_config.py::test_api_key_roundtrips_and_plaintext_never_stored",
+    "tests/invariants/test_provider_config.py::test_missing_secret_key_is_rejected",
+    "tests/invariants/test_provider_config.py::test_decrypt_failure_raises_instead_of_returning_empty",
+    "tests/invariants/test_provider_config.py::test_direct_sql_select_cannot_read_plaintext",
+    "tests/invariants/test_provider_config.py::test_missing_secret_key_fails_startup",
+]
+evidence = "2026-11-03（格 2）。加密原语 `db/crypto.py`（Fernet + SHA-256 派生）；**存储面打通**：路由是明文的最后一站——`POST /api/settings/providers` 经 `crypto.encrypt` 落库，读接口的 DTO 根本没有 key 字段；解密唯一一跳在装配层 `deps._chat_for`（db 与 llm 同层互不 import，拼接本来就属于装配）。缺密钥在 `build_deps` 抛 MissingSecretKey——**启动失败**，不是第一个写凭据的请求才炸；测试默认密钥由 tests/conftest.py 提供，生产的 None 直达关卡。改坏验证：明文直落库 → select 那条红；require_secret 改成缺省兜底 → 启动那条红"
+
+[[tool.agentworkbench.verification]]
+id = "S-V7"
+req = "REQ-22"
+invariant = "一"
+claim = "并发激活两个供应商后 is_active=1 恰好一行；直接 SQL 插两行必须被库拒绝"
+negative = "去掉部分唯一索引、只靠'先清 0 再置 1'的事务 → 直接 SQL 负控红（并发与手工 SQL 时另一个激活行静默失效，GetActiveProviderAsync 取 id 最小那条，没人知道另一行坏了）"
+status = "pass"
+tests = [
+    "tests/invariants/test_provider_config.py::test_direct_sql_cannot_create_two_active_providers",
+    "tests/invariants/test_provider_config.py::test_activate_switches_exactly_one_row",
+]
+evidence = "2026-11-03（格 2）。set_active：全表清 0 → 置 1 一个事务；目标不存在抛 LookupError **回滚**（否则留下「全部失活、谁也没激活」的库），路由翻译 404。终态由 ux_providers_active（全表级部分唯一索引）兜底——事务管过程，索引管并发与手工 SQL。**索引是全表级的，providers 没有 tenant 列**——REQ-22 是平台配置，BYOK 刻意不做。改坏验证：摘掉索引 → 负控红（正控仍绿——正控走事务路径，恰好说明两层各管一半，谁也不能单独扛）"
+
+[[tool.agentworkbench.verification]]
+id = "S-V8"
+req = "REQ-22"
+invariant = "一"
+claim = "每个供应商至多一个默认模型、同一模型不许加两次；任何读接口响应不含 api_key 明文（哨兵法全量遍历读接口）"
+negative = "读接口回传 api_key → 哨兵红；去掉 ux_provider_models 两层约束 → 同模型两行 / 两默认行，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_provider_config.py::test_default_model_is_unique_per_provider",
+    "tests/invariants/test_provider_config.py::test_same_model_cannot_be_added_twice",
+    "tests/invariants/test_provider_config.py::test_no_read_response_carries_the_credential",
+]
+evidence = "2026-11-03（格 2）。库层：UNIQUE(provider_id, model) + ux_provider_models_default（WHERE is_default=1）。读接口 GET /api/settings/providers 是白名单 DTO（ProviderDto/ModelDto 逐字段列名）——**连字段名都不出去**：\"apiKey\": null 这种键等于告诉读者「这里有个凭据」，是在为将来顺手填上铺路；has_api_key 布尔满足界面「配没配」。改坏验证：摘掉同模型 UNIQUE → 负控红；哨兵那条对明文、密文、字段名三层都断言"
+
+[[tool.agentworkbench.verification]]
+id = "S-V9"
+req = "REQ-22"
+invariant = "一"
+claim = "配置失效必须显式报错：清空 api_key / 删默认模型 / base_url 不可达 → 明确错误码，且假客户端零请求"
+negative = "空 api_key 落回占位串继续答（llm 层旧实现）→ 红；没配模型落回配置节默认值（C# `ResolveAsync:120` 的 `_fallback.Model`）→ 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_provider_config.py::test_empty_api_key_is_an_error_not_a_placeholder",
+    "tests/invariants/test_provider_config.py::test_missing_default_model_is_an_error",
+    "tests/invariants/test_provider_config.py::test_unreachable_endpoint_is_model_unavailable",
+]
+evidence = "2026-11-03（格 2）。判别搬到 `db/repositories/providers.py::resolve_active_row`（llm 层旧函数删除——它就是占位串违规的住址）：无激活供应商 / 激活无默认模型 / 缺 base_url / **缺 api_key** 四种形态各自 MODEL_NOT_CONFIGURED，message 指到该改的地方。**占位串违规已修**。零请求断言用替换 `llm.providers.OpenAI` 构造函数的方式——配置错误的路径上**连客户端对象都不许构造**，比「没收到请求」硬一档（先构造再放弃、发出去才 401 的实现在这里现形）。不可达端点直调客户端验 MODEL_UNAVAILABLE（retryable，与配置失效的不可重试分开）。改坏验证：删掉空 key 检查 → 零请求那条红（客户端被构造出来了）"
+
+[[tool.agentworkbench.verification]]
+id = "S-V10"
+req = "REQ-22"
+invariant = "一"
+claim = "chat 与 embedding 两组配置分治：改 embedding 配置后索引待重建，search 与 ask 都报 index_stale，而不是返回空列表冒充「资料里没有」；重建完成后恢复"
+negative = "改配置不重建、检索返回空 → 与「库里没有资料」不可区分（症状一样、没人报错）→ 红；两组配置合并进同一个响应体 → 设置页并排，有人会一起改 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_embedding_stale.py::test_embedding_change_marks_index_stale",
+    "tests/invariants/test_embedding_stale.py::test_search_refuses_when_stale_instead_of_returning_empty",
+    "tests/invariants/test_embedding_stale.py::test_ask_refuses_when_stale_too",
+    "tests/invariants/test_embedding_stale.py::test_rebuild_marks_synced_again",
+    "tests/invariants/test_embedding_stale.py::test_embedding_settings_do_not_include_chat_config",
+]
+evidence = "2026-11-03（格 4）。`db/repositories/system_state.py`：embedding.model（想要的）/ embedding.synced（索引实际用的），两值不同 = stale；`set_embedding_model` 先把改之前的值固化成 synced（不固化则改完判不出脏——负控形态），`mark_index_synced` 是重建完成的唯一收尾（全量重建端点归 F2，现在直调）。**检查点放检索函数入口**（`rag/freshness.ensure_index_fresh`，由 `retriever.retrieve` 与 `indexer.search_fts` 各自调用）：放路由层等于「今天记得写、明天忘一处」，放检索层则绕过它的唯一办法是不用检索。接口：`GET/PUT /api/settings/embedding`，DTO 字段集硬断言 {model, indexedModel, stale}——chat 配置在 /api/settings/providers，两组不合流。顺带修了一处真问题：eval fixture 库是旧 schema 快照，缺 system_state 表导致检索报 no such table——按升级路径补表（等价 create_schema 对旧库的动作）。改坏验证 4 组：闸门不拦 → 检索两条红；stale 恒 False → 两条红；只摘 search_fts 的检查 → search 红而 ask 仍绿（证明两个入口各自独立）；不固化基线 → 置 stale 那条红"
+
+# S-V11（2026-11-04 补）：部署入口与静态托管。这一条不来自 F6 原 REQ 表，
+# 来自一次盘点——MVP 四句成功标准里「别人能装起来」是唯一零进度的一条：
+# 没有 __main__、没有启动命令、web/dist 没有出口，clone 下来不知道怎么跑。
+# 备份（NFR-08）与监控阈值（NFR-09）仍未成文，登记在 F6 §2.3。
+[[tool.agentworkbench.verification]]
+id = "S-V11"
+req = "NFR-07（部署可复现）"
+invariant = "通"
+# 「通」在这里是延伸用法：REQ-17 的「只经 HTTP 走完」往前推一步——
+# 从 clone 到能访问界面的一条命令通路。部署断在半路，后面全白搭。
+claim = "python -m agentworkbench serve 一条命令启动；/ 返回 index.html；/chat 等前端路由回落 index.html；/api/* 未匹配路径仍 404 JSON；dist 缺失时 API 照常启动且日志有警告"
+negative = "回落对 /api 也生效 → 未知接口返回 HTML 200，「路径写错」被伪装成「请求成功」→ 红；mount 挂在业务路由之前 → API 整体被静态层吞掉 → 红；dist 缺失抛异常 → 开发态被挡在门外 → 红；前端路由回落写成 404 → 用户看到的最后一步是错误页 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_serve.py::test_slash_serves_the_index_page",
+    "tests/invariants/test_serve.py::test_frontend_routes_fall_back_to_the_index_page",
+    "tests/invariants/test_serve.py::test_unknown_api_paths_stay_404",
+    "tests/invariants/test_serve.py::test_api_routes_win_over_the_static_mount",
+    "tests/invariants/test_serve.py::test_missing_dist_still_serves_the_api",
+    "tests/invariants/test_serve.py::test_static_assets_are_served",
+]
+remaining = "缓存策略（index.html 不缓存、带 hash 的资产长缓存）先交给 StaticFiles 默认 ETag，内网小系统够用；重开条件是出现「改了前端用户拿不到新版」。真机冒烟（uvicorn 起服务 curl 四端点）已手工跑过，未进 CI——CI 的 tests 段用 TestClient 覆盖同一路径"
+evidence = "2026-11-04。实现在 `cli.py`（serve 命令，uvicorn 只在这里 import）+ `spa_static.py`（SpaStaticFiles 子类）+ `app.py` 尾部挂载（**必须最后挂**：先注册先匹配，先挂会吞掉整个 API——那类错在走注入桩的单元测试里全绿）。**最大的坑是 Starlette 的 404 是抛 `HTTPException` 不是返回 404 响应**——按返回值判断的回落版本看起来完全正确，永远不触发；是回落测试抓住的。另一处顺手修了上一格的漏网：上传路由读 `settings.suffix_set`（默认 `.pdf`），Office 三类只加在了常量里——HTTP 传 docx 仍被拒而测试全绿；默认值已对齐并加一致性测试锁住（`test_settings_default_matches_the_whitelist`）。改坏 5 组全红；真机冒烟：`serve` 起服务后 health 200、/ 与 /chat 均返回真 index、/api/未知 404"
+
+# S-V12（2026-11-04 补）：备份与恢复。MVP 第 4 句的四件事里「装起来」（S-V11）之后
+# 剩下的两件。 出处 NFR-08（非功能需求文档尚未成文，判据直接立在这里）。
+# 技术路线先探过针再定：VACUUM INTO 对含 vec0 虚表的库可用（源连接必须已加载扩展，
+# VACUUM INTO 会在目标库重建虚表）、热备可行（另一连接持有未提交写事务不挡也不泄）、
+# 产物单文件无 -wal 伴生——这些都是跑通实验才写进实现的，不是查文档猜的。
+[[tool.agentworkbench.verification]]
+id = "S-V12"
+req = "NFR-08（备份恢复）"
+invariant = "通"
+# 「通」同 S-V11 的延伸用法：备份断在半路（库备了文件没备）比不备更危险——
+# 恢复出来的是「目录说有、盘上没有」的半套系统。
+claim = "backup 一条命令产出自足备份目录（库的一致副本 + files/ 上传文件），服务运行中可做（未提交事务不进备份）；restore 一条命令把备份装回空目录，恢复后的库能过 quick_check、能跑 vec0 KNN 检索；备份损坏/非本产品的库/缺库文件时恢复拒绝执行且目标一字不动；恢复原子替换并清掉旧库 -wal/-shm 残留"
+negative = "只备库不备 files/ → 恢复出半套系统（stored_path 全悬空）→ 红；备份允许覆盖已有目录 → 毁掉用户最后一份好版本且无确认兜底 → 红；备份把未提交事务带进去 → 恢复出用户没确认过的数据 → 红；恢复不先验备份 → 损坏备份换上目标库、好数据被毁 → 红；恢复不清 -wal/-shm → 旧 WAL 内容对不上新库，打开即损坏 → 红"
+status = "pass"
+tests = [
+    "tests/invariants/test_backup.py::test_backup_carries_every_table_and_the_vector_index",
+    "tests/invariants/test_backup.py::test_backup_is_hot_uncommitted_writes_neither_block_nor_leak",
+    "tests/invariants/test_backup.py::test_backup_refuses_to_overwrite_an_existing_backup",
+    "tests/invariants/test_backup.py::test_backup_refuses_when_the_database_does_not_exist",
+    "tests/invariants/test_backup.py::test_restore_produces_a_working_system",
+    "tests/invariants/test_backup.py::test_restore_refuses_a_corrupt_backup_and_leaves_the_target_untouched",
+    "tests/invariants/test_backup.py::test_restore_refuses_a_foreign_sqlite_file",
+    "tests/invariants/test_backup.py::test_restore_refuses_a_backup_directory_without_a_database",
+    "tests/invariants/test_backup.py::test_restore_clears_stale_wal_side_files",
+    "tests/invariants/test_backup.py::test_cli_backup_and_restore_round_trip",
+    "tests/invariants/test_backup.py::test_cli_reports_failure_with_a_nonzero_exit_code",
+]
+remaining = "恢复是停服操作（SQLite 单文件形态的边界，CLI 提示与文档写明，未做在线恢复）；换机器恢复必须带同一个 AWB_SECRET_KEY 否则供应商凭据解不开（提示在 --help 与 README，代码校验不了——密钥对不对只有解密那一刻知道）；files/ 恢复是合并拷贝，备份之后删掉的文件恢复不回来（多删不可逆，文档写明）；定时备份与保留策略归运维 cron，不进产品"
+evidence = "2026-11-04。实现在 `db/backup.py`（backup / restore / _validate，~140 行）+ `cli.py` 两个子命令。**先探针后实现**：VACUUM INTO × sqlite-vec、热备 × 未提交事务两条都先跑了实验脚本确认行为才动手。恢复顺序是「先验备份（quick_check + 关键表存在）→ 再动目标」，临时文件落在目标目录内保证 os.replace 同盘原子；改坏两处各红：跳过入口校验（损坏备份先污染目标的 files/ 再失败）、跳过 -wal/-shm 清理——第二条第一轮没红，原因是损坏备份目录里没放 files/，抓不住顺序，**测试补强后重跑才红**：负控自己也要验真，不是写出来就算数。11 条测试；备份产物实测含全部表 + KNN 可查"
+
+[[tool.agentworkbench.verification]]
+id = "S-H1"
+req = "REQ-17"
+invariant = "通"
+claim = "空库首次部署：按文档用 curl 配出供应商与模型，完成第一次问答，全程无前端"
+negative = "任何一个环节必须开浏览器 → 判据不成立；'删掉前端'只是口号"
+status = "manual"
+evidence = "未验：需要一次真实部署。scripts/smoke.py 已是这条路径的半自动版（差凭据配置一步的文档化）。失效条件：F1 登录端点上线后必须补进脚本，否则又回到'看起来能、实际要开浏览器'"
+
+[[tool.agentworkbench.verification]]
+id = "S-H2"
+req = "REQ-20"
+invariant = "稳"
+claim = "拿 request_id 在日志里还原一次失败：能看到 code、模型、耗时、上游状态；看不到凭据"
+negative = "日志里出现 api_key 明文 → 排障记录本身成了泄露源，红"
+status = "manual"
+evidence = "机制已建（2026-11-03）：request_id 进中间件 contextvars + 响应头，structlog 已在依赖。剩人工部分：真跑一次失败（不可达端点），拿 X-Request-Id 翻日志核对四样信息齐全、凭据不出现。自动化的哨兵测试（S-V5）守的是响应侧，日志侧的完整性只能人工核"
+
+
+# ─────────────────────────────────────────────────────────────
+# F1 身份与访问控制（2026-11-04 登记）
+#
+# 不变量五条：认（不认就不给）/ 隔（团队边界）/ 属（资源归属）/
+# 记（拒绝留痕）/ 界（账户与权限的上限）。
+#
+# 这批条目的状态按「实现到哪一层」推进，不是按「写了多少行」：
+# 18 条 V 里 17 条已 pass，剩下 1 条 partial：
+#   V11 「A 创建高于自己的角色 → 403」在当前两档角色下不可达
+# 5 条 manual 全部卡在真实部署或人眼判断。
+#
+# 格 6 之后有一条结构性变化：**「任一业务接口」这句话不再需要逐条列**。
+# 闸门是 app 级依赖，所以判据里的「任一」由结构保证，而不是由「我们记得给
+# 每条路由挂了判定」保证——后者在新增第 21 条路由那天就不成立了。
+# 格 7 补的是两头：入场的存量（bind_tenant）与出场的界面（I-V17）。
+# 后者本来是 F1 唯一没人管的一块——登录页早就存在，但没人给它写过判据。
+#
+# V18 不在任何表格里：它来自「`settings` 六条端点只要求登录，而 providers
+# 是全局表」这一次实读。这类洞不会在补判据时出现，只会在读代码时出现——
+# 而它一旦存在，任何成员两步就能把全平台流量导走。
+#
+# 与 F5/F6 的一处不同：这里的 V 条目里有一半是「已有代码、等换血就能验」。
+# 阶段 1 把 owner 参数写进了 65 处仓储调用（会话 / 消息 / run / 轨迹），
+# 所以 隔 与 属 两类不是从零加隔离，是改 3 处固定值（caller_of、
+# 上传时的 settings.tenant_id、retriever 里的 `_ = scope`）。
+# ─────────────────────────────────────────────────────────────
+
+[[tool.agentworkbench.verification]]
+id = "I-V1"
+req = "REQ-AUTH-01"
+invariant = "认"
+claim = "除白名单（/health、登录、接受邀请）外，任一业务路由无票据访问返回 401；白名单内的路由不返回 401"
+negative = "把某条业务路由加进白名单 → 该条红；判定改成「无票据时按固定租户放行」→ 红（这正是阶段 1 的形态，也是 C# 版 `GetOwner()` 返回空串的形态）"
+status = "pass"
+tests = [
+    "tests/invariants/test_global_gate.py::test_every_business_route_is_behind_the_gate",
+    "tests/invariants/test_global_gate.py::test_a_route_added_after_create_app_is_still_gated",
+    "tests/invariants/test_global_gate.py::test_the_whitelist_is_reviewed_not_silently_grown",
+    "tests/invariants/test_global_gate.py::test_the_whitelist_is_reachable_without_a_session",
+    "tests/invariants/test_global_gate.py::test_the_gate_runs_before_the_body_is_validated",
+    "tests/invariants/test_identity_endpoint.py::test_me_without_a_cookie_is_401",
+    "tests/invariants/test_identity_endpoint.py::test_members_requires_a_session",
+]
+evidence = "2026-11-04（格 6）。闸门挂成 **app 级依赖**（`create_app(dependencies=[Depends(require_session)])`），不是每条路由写一遍：判据要的是「任一业务路由」，而「写了 20 条」和「挡得住第 21 条」是两件事。第一条测试**遍历路由表**逐条断言 401，并带两个自检（路由数 ≥ 30、实际检查数 ≥ 20）——遍历到 0 条时这条不变量恒真且全绿，`declarations.api_routes` 记过同款陷阱。第二条测试在 `create_app` 之后**现加一条路由**，断言它同样被挡：把闸门改回「每条路由自己写」的版本时，遍历那条仍然全绿（20 条都写了），这条会红。第三条是前两条的补丁：遍历的跳过集合就是 `PUBLIC_PATHS` 自己，于是把业务路由塞进白名单之后遍历会自动跳过——白名单金表那一断言堵的就是这个自证洞。白名单内那三条断言的是**错误码**而不是状态码：登录失败也是 401（`invalid_credentials`），只看状态码分不出「登录入口被闸门挡住」和「口令确实错了」。改坏验证：去掉 app 级依赖 → 第二条红；把 `/api/settings/providers` 塞进白名单 → 第三条红。**一处已知缺口（未修，留待产品决定）**：`settings` 下六条平台级配置路由现在只要求「登录」，不要求管理员——任何成员都能改供应商 `base_url`。这在 F1 的判据里没有对应条目（文档 §1.3 只写了「读侧归本域」），所以没有在这一格里顺手加一个没人验收的限制；它记在 F1 文档 §四。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V2"
+req = "REQ-AUTH-02 / 04 / 05"
+invariant = "隔"
+claim = "拿他人团队资源的真实 id，四类路径都取不到：文档、会话、轨迹、检索结果；响应与「随机 UUID」的 404 剥掉 request_id 后逐字段相同；检索不返回他团队文档的任何片段（不只是不显示）"
+negative = "团队条件只加在路由层、retriever 的 scope 仍是 `_ = scope` → 直接调 retrieve 仍拿得到他团队的块，红；只在列表接口过滤而按 id 取仍放行 → 红。**这条的两个陷阱都是「签名对了但没人传」**：`runner.ask(scope=)` 有参数，answer_flow 却从没传过"
+status = "pass"
+tests = [
+    "tests/invariants/test_tenant_isolation.py::test_document_list_shows_only_my_team",
+    "tests/invariants/test_tenant_isolation.py::test_another_teams_document_is_byte_identical_to_a_random_id",
+    "tests/invariants/test_tenant_isolation.py::test_deleting_another_teams_document_leaves_it_intact",
+    "tests/invariants/test_tenant_isolation.py::test_search_returns_no_fragment_from_another_team",
+    "tests/invariants/test_tenant_isolation.py::test_search_still_finds_my_own_document",
+    "tests/invariants/test_tenant_isolation.py::test_hybrid_retrieval_never_surfaces_another_teams_chunks",
+    "tests/invariants/test_tenant_isolation.py::test_hybrid_retrieval_still_finds_my_own_chunks",
+    "tests/invariants/test_tenant_isolation.py::test_conversation_list_and_detail_are_scoped",
+    "tests/invariants/test_tenant_isolation.py::test_trace_of_another_teams_run_is_not_reachable",
+]
+evidence = "2026-11-04（格 5）。四类路径各自一组，两个真实团队（引导建的甲 + 仓储建的乙）各一份文档与一条会话。**这一格的关键是「换个人登录，where 里的值真的变了」**——阶段 1 的同类测试只能证明「SQL 里有个 where」，因为 owner 是常量。三处固定值全部换血：`deps.caller_of()` 删除，归属改由 `identity_context.owner_of` 从 cookie→票据→账户→判定取；上传的 `settings.tenant_id` 改成 `owner.tenant_id`；`retriever` 的 `_ = scope` 改成真过滤。**检索过滤有两条路，只验一条会漏**：`search_fts` 的 SQL 子查询（全文路）与 `_meta_of` 的 join（向量路），后者只有直接调 `retrieve` 才覆盖得到——`GET /api/knowledge/search` 只走全文路。改坏验证五组全红：按 id 取不带团队条件 / 列表不带 / 全文检索不带 / 向量路回表不带 / 归属退回固定值。补充一句 `runner.ask` 的 `tenant_id`：这个参数早就存在（名字叫 scope），而 `answer_flow` 从来没人传过——「签名对了但没人传」是这条判据最典型的坑，现在它必填且没有默认值。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V3"
+req = "REQ-AUTH-03"
+invariant = "属"
+claim = "已登录用户对他人会话执行 DELETE/PATCH → 404，且该行全列哈希与 updated_at 不变（含 messages 与 message_citations 的计数）"
+negative = "把判定放进事务里（先删后判）→ 越权那条的行数变了，红；用「先查会话、再按 id 删」两步实现 → 并发窗口里能删掉，红（F5 的 list_messages 注释记过这类写法）"
+status = "pass"
+tests = [
+    "tests/invariants/test_conversations_endpoint.py::test_deleting_someone_elses_conversation_leaves_it_intact",
+    "tests/invariants/test_tenant_isolation.py::test_the_same_user_in_another_tenant_owns_nothing_here",
+    "tests/invariants/test_tenant_isolation.py::test_conversation_list_and_detail_are_scoped",
+]
+evidence = "2026-11-04（格 5/7）。换血之后走的是真实登录身份，会话与消息的 owner 条件在 SQL 里（65 处调用一行没改，因为归属一直是个 `Owner` 参数）。越权删除 → 404 且该行**全列不变**：格 7 把原来「数三张表的行数」换成 `select *` 的行指纹 + 消息条数 + 引用条数——只数行数有个洞（删一条插一条，行数一样而内容已经换了），而 `select *` 不会随加列失效。再加一条：`user_id` 相同但 `tenant_id` 不同的会话也删不掉。这条不是凑数——没有它，删除 SQL 里那句 `and tenant_id = ?` 可以整段删掉而测试全绿（两个用户的 `user_id` 本来就不同，只用 `user_id` 过滤也保护得住），也就是说那句话之前是没人验过的。判据里的 `/PATCH` 一半不存在：会话没有改名接口（§2.1 把「续聊、改名」划给 F5）。改坏验证：把 `and tenant_id = ?` 去掉 → 那条新测试红。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V4"
+req = "§1.3 拒绝记录"
+invariant = "记"
+claim = "一次越权 404 之后，按响应的 X-Request-Id 能查到一条记录：action、resource_kind、resource_id、reason_code 齐全；同一时刻一次正常的 200 不产生任何记录"
+negative = "把写入注掉 → 查到 0 条，红；写在响应之后（异步/后台）→ 用「关闭写入后同一压测 p95 必须下降」反查，不降说明它没落在响应前，红；复用 trace/recorder → 库里出现一条没有终态的 run，红（拒绝不是一次执行）"
+status = "pass"
+tests = [
+    "tests/invariants/test_global_gate.py::test_a_404_leaves_a_record_findable_by_request_id",
+    "tests/invariants/test_global_gate.py::test_a_successful_request_writes_nothing",
+    "tests/invariants/test_global_gate.py::test_a_401_is_recorded_without_an_actor",
+    "tests/invariants/test_global_gate.py::test_a_401_records_the_exact_reason_not_a_generic_one",
+    "tests/invariants/test_global_gate.py::test_a_403_records_who_was_refused_and_why",
+    "tests/invariants/test_global_gate.py::test_a_failed_record_write_becomes_500_not_404",
+    "tests/invariants/test_global_gate.py::test_public_paths_do_not_flood_the_table",
+]
+evidence = "2026-11-04（格 6）。写入点挂在 `AppError` 的异常处理上，不散在各路由的 `raise` 之前：路由里有 15 个 `not_found(...)` 出口，将来还有第 16 个，而「忘掉调一次记录」不会报错——它只是安静地少一条证据。挂在异常处理上是 1 个「必然」，不是 15 个「记得」。顺序也是判据要的：它在响应发出之前同步执行（`I-H3` 的压测反查仍然要人做，那是性能判定）。`action` 记**方法 + 路由模板**而不是 `request.url.path`——后者会把真实 id 写进动作列，于是「这个动作发生过多少次」变成按 id 分组的问题。`resource_kind` 从路径参数名推（`{doc_id}` → document），不让路由自己传：那是第 16 个「要记得写」的地方，而这一列错了没人会发现。`reason_code` 优先用判定层给出的（`principal_of` 把 `decision.reason` 带进异常）——**这是唯一能证伪的断言**：401 下面压着六种原因，停用的会话必须记成 `session_expired` 而不是兜底的 `unauthenticated`。404 只有一种理由（`resource_missing`）：路线按团队条件查，本来就分不出「不存在」与「属于别人」，分成两个码会让读记录的人以为自己知道了一件没验过的事。公开路径（登录 / 接受邀请）不记：那是匿名可达的写入口，一次脚本就能把表打满，而登录失败已经有 `users.failed_attempts` 在记。记录写失败 → 500，不许照常回 404：404 是一句「查过了，没有」，而系统手上没有证据。改坏验证五组：注掉写入 / 动作记真实 URL / 判定原因丢掉 / 写失败照常回 404 / 公开路径不记 → 各自对应的那条红。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V5"
+req = "REQ-AUTH-06"
+invariant = "认"
+claim = "tenant_id 为 NULL 或空串的行，对任何用户（含管理员）按 id 取一律 404；判定函数在身份缺失时返回 deny，不回落到任何默认租户"
+negative = "判定改成 allow-on-missing → 红；把 owner 参数做成可选（默认 None 表示「不过滤」）→ 红——那是「忘传等于全放行」的入口"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_resource_without_tenant_is_404_for_everyone_including_admin",
+    "tests/invariants/test_identity_policy.py::test_account_without_a_tenant_is_denied_and_falls_back_to_nothing",
+    "tests/invariants/test_identity_policy.py::test_allow_without_a_principal_cannot_even_be_constructed",
+    "tests/invariants/test_retriever.py::test_tenant_parameter_is_required",
+    "tests/invariants/test_tenant_isolation.py::test_a_document_without_a_tenant_belongs_to_nobody",
+    "tests/invariants/test_tenant_binding.py::test_dry_run_counts_and_writes_nothing",
+    "tests/invariants/test_tenant_binding.py::test_apply_moves_the_rows_and_they_become_visible",
+    "tests/invariants/test_tenant_binding.py::test_running_twice_is_harmless",
+    "tests/invariants/test_tenant_binding.py::test_an_unknown_target_is_refused",
+    "tests/invariants/test_tenant_binding.py::test_binding_to_itself_is_refused",
+    "tests/invariants/test_tenant_binding.py::test_a_sha_collision_is_refused_before_anything_is_written",
+    "tests/invariants/test_tenant_binding.py::test_a_collision_shows_up_in_the_dry_run_too",
+    "tests/invariants/test_tenant_binding.py::test_cli_dry_run_exits_zero_and_changes_nothing",
+    "tests/invariants/test_tenant_binding.py::test_cli_apply_moves_the_rows",
+    "tests/invariants/test_tenant_binding.py::test_cli_refuses_an_unknown_team_with_exit_2",
+    "tests/invariants/test_tenant_binding.py::test_cli_defaults_the_source_to_the_legacy_tenant",
+]
+evidence = "2026-11-04（格 1/5/7）。判定层与存储面：无归属的行（NULL/空串/纯空白）对任何人 404；账户行没有归属时 deny 且 owner 为 None（不回落任何默认租户）；`Decision(Outcome.ALLOW)` 不带归属**连构造都不行**。存储面：`repo.get` / `list_all` / `list_pages` / `list_chunks` / `search_fts` / `retrieve` / `runner.ask` 的 `tenant_id` 全部必填、无默认值——漏传是 `TypeError`，而默认 `None` 表示「不过滤」正是这条判据反对的入口。**存量绑定在格 7 补上**（`db/rebind.py` + `scripts/bind_tenant.py`）：阶段 1 的行落在 `default` 租户下，绑之前对所有人 404，绑到真实团队之后按 id 取得到。三条拒绝写在写之前——源与目标相同（等于什么都没做却像成功了）、目标团队不存在（绑过去仍然 404，而退出码是 0）、`documents` 的 `unique(tenant_id, sha256)` 冲突（直接 UPDATE 会整批回滚，报错只有一行 `UNIQUE constraint failed`）。冲突**不跳过**：跳过的版本让命令报成功，剩下几行还在旧租户里，没有任何东西会提醒运维。三张父表在一个事务里改；`messages` / `chunks` 之类没有租户列，跟着父行走。改坏验证四组：忽略 apply / 去掉冲突检查 / 不查目标团队 / 默认就真跑 → 各自对应的那条红。"
+[[tool.agentworkbench.verification]]
+id = "I-V6"
+req = "REQ-AUTH-08"
+invariant = "界"
+claim = "A 登录后签发的 cookie，在 A 被停用后的一个配置窗口内访问任一业务接口 → 401；恢复后同一账号能重新登录并拿到新 cookie"
+negative = "只拦新登录、不吊销票据 → 旧 cookie 仍 200，红；把窗口写成模块常量而非配置 → 与 I-V10 一起红"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_service.py::test_disable_kills_existing_sessions_immediately",
+    "tests/invariants/test_identity_service.py::test_enable_restores_login_but_does_not_revive_old_tickets",
+    "tests/invariants/test_identity_endpoint.py::test_disable_kills_the_members_session_immediately",
+    "tests/invariants/test_global_gate.py::test_a_disabled_account_loses_every_business_route",
+    "tests/invariants/test_global_gate.py::test_zero_window_makes_revocation_immediate",
+]
+evidence = "2026-11-04（格 3/4/6）。`service.disable_user` 在同一事务里置 disabled 并吊销该用户全部票据，旧票据下一次判定即 401——原因码是 `session_expired` 而不是 `account_disabled`，因为票据在 ① 步就被吊销拦下、走不到 ② 步的 status（两者对外同为 401）。「任一业务接口」这一句在格 6 变成可验的：闸门挂成 app 级依赖之后，`test_a_disabled_account_loses_every_business_route` 逐条走 documents / conversations / auth-me，三条都是 401，且**恢复之后旧 cookie 仍然 401**（吊销是永久的，恢复不等于复活旧票），重新登录才拿到新 cookie。**「一个配置窗口内」的口径写清楚**：`session_invalidate_seconds` 是**最大陈旧度**（`.NET` 的 `SecurityStampValidationInterval` 同一个语义），配 0 时下一个请求即 401（测试用 0，§1.5），配 N 时最多 N 秒后必然 401——把它读成「立刻失效」是读窄了，把它读成「永不失效」是读错了。改坏验证：把锁定判定塞进受保护请求 → `test_a_lockout_elsewhere_does_not_kick_an_existing_session` 红（那是 `I-V8` 的方向）；窗口 TTL 写成常数 60 → `test_zero_window_makes_revocation_immediate` 红。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V7"
+req = "REQ-AUTH-07 / 08"
+invariant = "界"
+claim = "停用后 status=disabled 且 lockout_until 为空；连续失败锁定后 lockout_until 在未来且 status 仍为 active；两者各自恢复后另一个不受影响"
+negative = "合成一个 enabled 布尔 → 两条断言至少红一条；用 lockout_until = 远未来表示停用 → 停用那条红（status 没变）——这是社区里最常见的偷懒写法，Identity 的 LockoutEnd 文档也专门警告过"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_disabled_and_locked_report_different_reasons",
+    "tests/invariants/test_identity_policy.py::test_disabled_account_takes_precedence_over_lockout_in_the_record",
+    "tests/invariants/test_identity_store.py::test_status_change_requires_the_expected_current_value",
+    "tests/invariants/test_identity_store.py::test_credential_epoch_cannot_be_zero",
+    "tests/invariants/test_identity_store.py::test_role_and_status_check_rejects_unknown_values",
+    "tests/invariants/test_identity_service.py::test_disable_and_lockout_are_independent",
+]
+evidence = "2026-11-04（格 2/3/6）。`status` / `lockout_until` / `credential_epoch` 是三列而不是一个布尔，`CHECK` 拒绝枚举外的值，版本号不许为 0，停用/恢复带 expected 的 CAS。**两列互不影响已端到端验**：停用不写 `lockout_until`、达阈值锁定不改 `status`、恢复账号不清锁定（「顺手解锁」等于绕过失败计数，而管理员并不知道它为什么发生）。判据原文的六句全部有对应断言，格 4 遗留的「403 的响应体与记录」也随格 6 的拒绝记录落地（`test_a_403_records_who_was_refused_and_why`），只是它属于 `I-V4` 的覆盖面，不改变本条的状态。"
+[[tool.agentworkbench.verification]]
+id = "I-V8"
+req = "REQ-AUTH-07"
+invariant = "界"
+claim = "B 在别处连续输错 A 的邮箱达阈值后，A 已登录的会话仍能访问业务接口（200）"
+negative = "把 lockout 判定写进会话校验 → A 被挤下线，红。这是一条可预测的 DoS：拿别人邮箱乱试就能踢人，成本比拿密码低得多"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_locked_account_can_still_use_an_existing_session",
+    "tests/invariants/test_identity_policy.py::test_locked_account_cannot_start_a_new_login",
+    "tests/invariants/test_identity_policy.py::test_lockout_expires_by_time_comparison_not_by_a_write",
+    "tests/invariants/test_identity_service.py::test_locked_account_is_stopped_on_the_login_path_only",
+    "tests/invariants/test_identity_service.py::test_lockout_expires_by_clock_without_any_write",
+    "tests/invariants/test_global_gate.py::test_a_lockout_elsewhere_does_not_kick_an_existing_session",
+]
+evidence = "2026-11-04（格 1/3/6）。锁定的账户**已签发会话仍放行**（`judge_access` 的第 ② 步只看 `status`），同一账户在登录路径上被拦，到期靠时间比较而非写操作。判定点被拆在两个入口（受保护请求 / 登录），拆分理由写在 `login_block_reason` 的 docstring 里——§1.6 第 ② 步列了 `account_locked_out`，但 §1.4 与本条要求锁定不踢会话，取判据。**端到端在格 6 补上**：B 拿 A 的邮箱连错到阈值（先断言 A 自己也登不进来了，证明锁定确实生效），A 手里那张票访问 `/api/auth/me` 仍然 200。不这么做的话，这是一条成本极低的 DoS：拿别人邮箱乱试就能把他挤下线。改坏验证：把 `lockout_until` 判定并进 `judge_access` 的 ② 步 → 那条红。"
+[[tool.agentworkbench.verification]]
+id = "I-V9"
+req = "REQ-AUTH-09"
+invariant = "界"
+claim = "A 用 cookie1 发起改密成功后：cookie1 仍 200，改密前签发的 cookie2 → 401"
+negative = "改密时吊销该用户全部票据 → cookie1 也 401，红（用户改完密码自己被踢，第一反应是「系统坏了」）；只换哈希不递增 credential_epoch → cookie2 仍 200，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_ticket_from_an_older_credential_epoch_is_rejected",
+    "tests/invariants/test_identity_store.py::test_revoking_all_tickets_can_keep_the_one_that_asked",
+    "tests/invariants/test_identity_service.py::test_change_password_keeps_the_asking_session_and_kills_the_others",
+    "tests/invariants/test_identity_service.py::test_change_password_with_a_wrong_old_password_changes_nothing",
+    "tests/invariants/test_identity_service.py::test_admin_reset_kills_every_session_including_the_asking_one",
+    "tests/invariants/test_identity_endpoint.py::test_change_password_keeps_the_asking_cookie_and_kills_the_other",
+    "tests/invariants/test_identity_endpoint.py::test_change_password_with_a_wrong_old_password_is_401_and_changes_nothing",
+]
+evidence = "2026-11-04（格 3/4）。`service.change_password` 在同一事务里换哈希 + 版本 +1 + 吊销其余票据，并把发起改密的那张票**升到新一代**（`store.refresh_ticket_epoch`）——只保留行、不升版本的实现，`revoked_at` 与行数全对，但下一次请求仍被整数比较拒掉，用户感受到的还是「改完密码就被踢下线」。HTTP 层的判据原文：`POST /api/auth/password` 之后，cookie1 的 `GET /api/auth/me` 仍是 200，改密前登录的 cookie2 是 401，且它的票据行 `revoked_at` 非空（只靠版本比较不算吊销——库里会留一批永远不会再用的行）。旧口令错时 401 且一个字节都不变，旧口令仍然可用。**这条路由刻意不重设 cookie**：重设会把「保留的票没升版本」这个 bug 盖住——用户手里是新票、测试全绿、真问题没被证伪。改坏验证：把 `keep_id` 置 None → cookie1 那条红；去掉 `refresh_ticket_epoch` → 同样红（这正是格 3 抓到的那处）。管理员重置与本人改密的唯一差别是一张票都不留：重置的前提是「进不去了」或「凭据泄露」，保留哪一条都是在赌。"
+[[tool.agentworkbench.verification]]
+id = "I-V10"
+req = "REQ-AUTH-08 / 09"
+invariant = "界"
+claim = "session_invalidate_seconds 配 0 时，吊销后的下一个请求即 401；同一断言在配置改大后失败——证明读的是配置不是常量"
+negative = "把窗口写成模块级常量 → 改配置后行为不变，红；不配这个键却仍能启动 → 红（没有消费者的默认值比没有配置更糟）"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_service.py::test_auth_config_reads_the_settings_it_is_given",
+    "tests/invariants/test_identity_service.py::test_zero_where_zero_means_silently_off_is_refused",
+    "tests/invariants/test_identity_service.py::test_session_invalidate_seconds_may_be_zero",
+    "tests/invariants/test_global_gate.py::test_zero_window_makes_revocation_immediate",
+    "tests/invariants/test_global_gate.py::test_a_nonzero_window_really_holds_the_judgment",
+    "tests/invariants/test_global_gate.py::test_the_window_is_read_from_configuration_not_a_constant",
+]
+evidence = "2026-11-04（格 6）。消费者是 `identity/sessions.py::SessionCache`，挂在 `Deps` 上（进程级单例——建在路由里等于没缓存）。语义是**最大陈旧度**：配 0 不缓存、吊销的下一个请求即 401；配 N 时一次判定最多被复用 N 秒。判据原文的「同一断言在配置改大后失败」现在真的成立：`test_a_nonzero_window_really_holds_the_judgment` 用注入的单调时钟证明「吊销后仍然 200，过窗口才 401」——如果两条都断言「立刻 401」，把配置读成常量、甚至完全不实现缓存，测试也全绿。这层缓存**不主动失效**，这条是刻意的：每条吊销路径都回头清一遍的话，这个键就没有任何可观察的效果了，而「配了不生效的旋钮」正是 §1.8 的拒绝项。代价写在模块 docstring 里：要立刻生效就配 0。另外顺手修了一个真实缺陷——`SettingsConfigDict` 少了 `env_nested_delimiter=\"__\"`，`AuthSettings` 的 docstring 从格 3 起就写着 `AWB_AUTH__LOGIN_MAX_FAILURES`，而那**静默无效**（唯一现象是「配了不生效」）。改坏验证：缓存不取 / 缓存永不过期 / TTL 写成常数 60 → 三条断言各红一条。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V11"
+req = "REQ-AUTH-10"
+invariant = "界"
+claim = "管理员 A 管理本团队普通成员 B 允许；A 创建高于自己的角色（owner/超管）→ 403；A 停用自己 → 403 且自身 status 不变"
+negative = "只校验「是不是管理员」不校验目标角色 → 自封超管那条红；停用自己时先写后判 → status 变了，红"
+status = "partial"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_member_cannot_manage_anyone",
+    "tests/invariants/test_identity_policy.py::test_admin_cannot_disable_themselves",
+    "tests/invariants/test_identity_policy.py::test_admin_cannot_grant_a_role_above_their_own",
+    "tests/invariants/test_identity_policy.py::test_admin_can_manage_a_member",
+    "tests/invariants/test_identity_policy.py::test_the_authority_check_does_not_need_a_target",
+    "tests/invariants/test_identity_endpoint.py::test_disabling_yourself_is_403_and_leaves_the_row_untouched",
+    "tests/invariants/test_identity_endpoint.py::test_a_member_cannot_manage_anyone_even_a_nonexistent_id",
+    "tests/invariants/test_identity_endpoint.py::test_a_member_cannot_invite_an_admin",
+    "tests/invariants/test_identity_endpoint.py::test_promoting_a_member_takes_effect_on_the_next_request",
+    "tests/invariants/test_identity_endpoint.py::test_an_unknown_role_in_the_body_is_400",
+]
+remaining = "判定层与 HTTP 层都已验（2026-11-04 格 1/4）：非管理员 403、停用自己 403 **且 status 不变**（判定在写之前——先写后判的实现也返回 403，但那一行已经变了，而 403 让调用方以为什么都没发生）、目标角色高于自己 403、管理员管成员放行、改角色不重签票据。顺序另有一条：管理接口先 `judge_admin`（动作级，不需要目标）再查目标，否则非管理员拿一串 id 打接口时，404 与 403 的差别就是「这个人在不在」的探针；改坏验证证明把这一步挪后，那条测试会红。**还差**：判据里「A 创建高于自己的角色 → 403」在当前两档角色下不可达（管理员发 admin 邀请时 `ROLE_RANK` 相等，是允许的）；policy 层用 monkeypatch 模拟第三档角色走过真实分支，HTTP 层没有对应入口——加第三档角色时这条要补一条真实请求。"
+[[tool.agentworkbench.verification]]
+id = "I-V12"
+req = "REQ-AUTH-11"
+invariant = "界"
+claim = "空库执行引导 → 得到可登录管理员 + 一个团队，退出码 0；库里已有用户时再执行 → 非零退出，用户数与团队数都不变"
+negative = "去掉「已有用户即失败」→ 第二次执行成功，红（留着可用就是永久后门，而且没人会记得关）"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_bootstrap_is_open_only_on_an_empty_library",
+    "tests/invariants/test_identity_store.py::test_count_users_is_what_bootstrap_reads",
+    "tests/invariants/test_identity_service.py::test_bootstrap_creates_a_loginable_admin",
+    "tests/invariants/test_identity_service.py::test_bootstrap_refuses_a_second_run_and_changes_nothing",
+    "tests/invariants/test_identity_service.py::test_bootstrap_cli_exits_zero_and_leaves_a_working_account",
+    "tests/invariants/test_identity_service.py::test_bootstrap_cli_second_run_is_nonzero_and_writes_nothing",
+]
+evidence = "2026-11-04（格 3）。`scripts/bootstrap_identity.py` 退出码三档：0 建成 / 1 已引导 / 2 参数或环境不对——1 与 2 分开是因为运维要区分「我已经建过了」和「我命令敲错了」，两种的下一步完全相反，而两种都不留下半个团队。口令只从环境变量 `AWB_BOOTSTRAP_PASSWORD` 或交互终端取，**不接受 `--password`**（参数会留在 shell 历史与进程列表里，而它是一个长期有效的管理员口令）；输出里没有口令也没有票据。判据是 `count_users` 而不是「有没有跑过这个命令」——后者需要一张记状态的表，而那张表本身就是一个可被重置的开关。`count_users` 数**全表**：引导发生在有团队之前，按团队数会恒为 0、后门永远开着。改坏验证：去掉 `can_bootstrap` → 第二次执行成功，「用户数与团队数都不变」那条红；把「先判后建」改成「先建后判」→ 同样红（多出来的团队永远没人进去，却会出现在运维的列表里）；CLI 层把返回值写成 0 → 退出码那条红。"
+[[tool.agentworkbench.verification]]
+id = "I-V13"
+req = "REQ-03"
+invariant = "界"
+claim = "未过期且未用的邀请可建号并落在邀请者的团队；同一邀请第二次使用 → 404；过期邀请 → 404，且与「不存在的邀请」响应逐字段相同"
+negative = "邀请只在应用层判「用过」（先查再写）→ 并发两次都成功，红；过期判断放在建号之后 → 先建出人再报错，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_store.py::test_accepting_an_invite_twice_is_refused",
+    "tests/invariants/test_identity_service.py::test_invite_lands_in_the_inviters_team",
+    "tests/invariants/test_identity_service.py::test_the_same_invite_cannot_be_used_twice",
+    "tests/invariants/test_identity_service.py::test_expired_invite_raises_the_same_thing_as_a_missing_one",
+    "tests/invariants/test_identity_service.py::test_an_invite_naming_an_email_only_works_for_that_email",
+    "tests/invariants/test_identity_service.py::test_accepting_an_invite_for_a_taken_email_is_refused",
+    "tests/invariants/test_identity_endpoint.py::test_an_invite_brings_a_member_into_the_inviters_team",
+    "tests/invariants/test_identity_endpoint.py::test_a_used_invite_is_indistinguishable_from_a_missing_one",
+    "tests/invariants/test_identity_endpoint.py::test_an_expired_invite_is_indistinguishable_from_a_missing_one",
+]
+evidence = "2026-11-04（格 2/3/4）。过期判断在**建号之前**：先建后判会在过期邀请上留下一个没有入口的账号，而它唯一约束上的报错要到下一个人用同一张邀请时才出现。建号与「标记已用」同事务，并发的第二次拿到 0 行就整体回滚——被抢先建出来的账号一起消失。定向邀请只对那个邮箱有效（不做这条，「发给 A 的链接」在群里转一次，进来的人就是 B，而邀请记录指向一个没做错任何事的人）。四种不可用原因（不存在 / 已用 / 过期 / 邮箱不符）在路由层共用同一个 404 与同一句话：`service.accept_invite` 抛同一个异常类型，路由连异常消息都不读——读了就会有人把它转成更具体的提示，而那句话等于说「这张邀请曾经存在」。HTTP 层三条路径都断言了剥掉 request_id 后逐字段相同。改坏验证：去掉过期判断 → 过期那条红（账号被建出来了）；except 分支把 `{exc}` 拼进文案 → 逐字段相同那条红。"
+[[tool.agentworkbench.verification]]
+id = "I-V14"
+req = "REQ-01"
+invariant = "界"
+claim = "登出后同一 cookie 访问业务接口 → 401，且该票据行 revoked_at 非空（不是只清了客户端 cookie）"
+negative = "登出只删 cookie → 把 cookie 手工带上仍 200，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_service.py::test_logout_revokes_the_row_not_just_the_cookie",
+    "tests/invariants/test_identity_endpoint.py::test_logout_makes_the_same_cookie_useless",
+]
+evidence = "2026-11-04（格 3/4）。`POST /api/auth/logout` 做两件事：把票据行标记 `revoked_at`（服务端不再认它）+ 让浏览器丢掉 cookie。判据原文的「不是只清了客户端 cookie」在 HTTP 测试里是**手工把原值塞回 cookie jar 再请求一次**——TestClient 的 cookie 已经被删了，只看它等于什么都没验。重复登出返回 204（幂等）：登出失败没有任何用户能做的补救动作，把它报成错误只会让人重试。改坏验证：把 `service.logout` 那一段删掉只留 `clear_cookie` → 复用 cookie 那条红。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V15"
+req = "功能需求 §2.5"
+invariant = "认"
+claim = "GET/POST /api/auth/forgot-password、/api/auth/verify 一律 404；配置里没有任何 OAuth 提供方键；依赖里没有邮件库"
+negative = "引入 fastapi-users 的默认路由 → 这些端点自动存在，红。这正是「框架自带但没人验收」的入口，也是本域拒绝全套框架的理由之一"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_endpoint.py::test_endpoints_that_must_stay_absent_are_absent",
+    "tests/invariants/test_identity_endpoint.py::test_no_oauth_provider_or_mail_library_is_wired_in",
+]
+evidence = "2026-11-04（格 4）。四组（两条路径 × GET/POST）逐条断言 404，登记在 `routes/declarations.py` 的 `ABSENT` 表里——写成一张表而不是注释，是因为「哪天有人为了省事把它们加回来」时，这张表是唯一会挡在路上的东西。两个佐证：`Settings` 的字段里没有任何 oauth / smtp / mail 键；`project.dependencies` 里没有 fastapi-users / authlib / fastapi-mail / aiosmtpd / python-jose——断言的是依赖清单而不是 `find_spec`，因为包可能作为传递依赖被装上，而「出现在 dependencies 里」才是「我们决定用它」。这条判据防的不是写错，是框架替我们写好：`fastapi-users` 带上这几个端点，接进来那一刻它们就存在，而没有任何人会去验收。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V16"
+req = "§1.6 判定顺序"
+invariant = "认"
+claim = "未登录访问他人资源的 id → 401（不是 404）；已登录访问同一 id → 404（不是 403）；已登录访问自己的 → 200"
+negative = "把身份判定与归属判定合成「查不到就 404」→ 未登录那条变 404，红：登录态本身成了可推断的信息；把顺序换成先判归属 → 会出现「202 见过这个 id 就说明它存在」的侧信道"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_policy.py::test_missing_ticket_is_401_even_when_the_resource_exists",
+    "tests/invariants/test_identity_policy.py::test_foreign_resource_is_404_not_403",
+    "tests/invariants/test_identity_policy.py::test_own_resource_is_allowed_and_carries_the_owner",
+    "tests/invariants/test_identity_policy.py::test_identity_is_judged_before_ownership",
+    "tests/invariants/test_identity_policy.py::test_disabled_account_blocks_before_ownership_is_consulted",
+    "tests/invariants/test_identity_policy.py::test_ticket_pointing_at_another_account_is_indistinguishable_from_no_ticket",
+    "tests/invariants/test_identity_endpoint.py::test_me_without_a_cookie_is_401",
+    "tests/invariants/test_identity_endpoint.py::test_a_member_cannot_manage_anyone_even_a_nonexistent_id",
+    "tests/invariants/test_identity_endpoint.py::test_disabling_yourself_is_403_and_leaves_the_row_untouched",
+    "tests/invariants/test_identity_endpoint.py::test_member_list_is_scoped_to_my_team",
+    "tests/invariants/test_global_gate.py::test_identity_is_judged_before_ownership",
+]
+evidence = "2026-11-04（格 1/4/6）。四步顺序锁在 `judge_access` 一个函数里，401/404/200 三种出口由 `HTTP_STATUS` 唯一一张表决定；`api/identity_context.py` 的拒绝映射表把三种 `Outcome` 翻成三个错误码，**没有第四条**。端到端在格 6 补齐：同一份**真实存在**的文档，未登录 → 401、另一个团队的人 → 404、本人 → 200——三条一起才说明「身份先于归属」（只验 404 的版本分不出「先判归属」还是「先判身份」）。「非管理员对不存在的 id 打管理接口也是 403」那条守的是「先判动作、再查目标」，改坏验证证明把 `judge_admin` 挪后它就红。格 4 遗留的「`api` 用的是那张表而不是自己写字面量」这一句仍然只由结构保证（拒绝文案与状态码都从 `_REJECTION` + `ERROR_SPECS` 取，路由里没有字面量 401/403/404），没有一条测试去正则扫全仓——那种扫描会把 `Response(status_code=204)` 之类的合法字面量一起卷进来，收益不抵噪音。"
+[[tool.agentworkbench.verification]]
+id = "I-H1"
+req = "REQ-AUTH-11"
+invariant = "界"
+claim = "没参与开发的人按文档从零装出可登录管理员，并能建首个团队"
+negative = "卡住且说不清下一步；或需要口头补充（说明文档漏了一步）"
+status = "manual"
+evidence = "未验：需要一次真实空库部署。判据是「他能不能自己走完」，不是「我们能不能走完」——所以必须换人做"
+
+[[tool.agentworkbench.verification]]
+id = "I-H2"
+req = "REQ-AUTH-07"
+invariant = "界"
+claim = "正确口令 / 错口令 / 不存在账号 / 锁定中，四种响应的文案与状态码一致，且响应耗时接近"
+negative = "任一条多出「锁定」「不存在」「还剩 N 分钟」→ 不通过；或不存在账号时立刻返回（跳过假哈希）→ 响应快慢成了账号枚举器"
+status = "manual"
+evidence = "未验（2026-11-04 更新）：三条已经自动化了——「假哈希被执行过」（`test_unknown_email_still_runs_a_password_verification`）、「口令错 / 不存在返回同一个原因码」（`test_wrong_password_is_rejected_without_naming_the_account`）、以及 HTTP 层「停用 / 锁定与不存在账号的响应剥掉 request_id 后逐字段相同」（`test_a_disabled_account_looks_exactly_like_a_wrong_password` / `test_a_locked_account_looks_exactly_like_a_wrong_password`）。仍然要人看的：「看起来像不像同一个错误」这句话本身，以及四条路径的真耗时差异——自动化只能证「机制在」，证不了「像不像」。"
+
+[[tool.agentworkbench.verification]]
+id = "I-H3"
+req = "§1.3 拒绝记录"
+invariant = "记"
+claim = "拿一条真实 404，在拒绝记录里看到人、动作、原因、时间；对照实验是不查记录时同样的问题答不出来"
+negative = "只有 404 没有记录时，同样的问题答不出来（这是对照组，不是失败案例）"
+status = "manual"
+evidence = "未验（依赖读侧）：抽样 200 次跨团队请求，覆盖率目标 100%。另有一条压测判据——关闭写入后同一压测 p95 必须下降；不降说明写入没落在响应之前。两条都要真实部署后做"
+
+[[tool.agentworkbench.verification]]
+id = "I-H4"
+req = "REQ-AUTH-03"
+invariant = "属"
+claim = "打开他人会话链接，看到「资源不存在」且页面不空转"
+negative = "白屏、转圈或「重试」按钮 → 不通过（用户会以为系统坏了，然后反复重试）"
+status = "manual"
+evidence = "未验：前端还没接身份，等路由落地后人工看"
+
+[[tool.agentworkbench.verification]]
+id = "I-H5"
+req = "REQ-AUTH-02"
+invariant = "隔"
+claim = "两个团队各一人，互搜对方文档名——检索结果、引用、会话列表三处都不出现标题或片段"
+negative = "任一处搜到标题或片段 → 不通过（接口层的 I-V2 可能是绿的：它守的是 SQL，产品面的「看不出来」只能人看）"
+status = "manual"
+evidence = "未验：需要两个团队的真实数据"
+
+[[tool.agentworkbench.verification]]
+id = "I-V17"
+req = "§1.9 界面上的三件事 / REQ-01"
+invariant = "认"
+claim = "未登录访问任一页面跳登录页并保留原地址；任一接口 401 后清本地登录态并跳登录页；有登出入口；拿不到 /api/auth/me 时不伪造任何身份"
+negative = "`/me` 404 时回落到一个「本机」用户 → 反代吃掉 `/api/auth/*` 的部署变成「所有人都是管理员」，红；401 不触发跳转 → 用户停在每个操作都报错的页面，红；登录发 `userName` 而不是 `email` → 后端 422，红"
+status = "pass"
+tests = [
+    "web/tests/auth.spec.ts::test_login_posts_email_not_username",
+    "web/tests/auth.spec.ts::test_login_skips_the_extra_me_probe",
+    "web/tests/auth.spec.ts::test_wrong_password_surfaces_the_backend_message",
+    "web/tests/auth.spec.ts::test_me_401_means_not_signed_in",
+    "web/tests/auth.spec.ts::test_business_401_redirects_to_login_with_redirect",
+    "web/tests/auth.spec.ts::test_already_on_login_page_does_not_redirect",
+    "web/tests/auth.spec.ts::test_logout_clears_local_state",
+    "web/tests/auth.spec.ts::test_empty_body_returns_undefined",
+    "web/tests/auth.spec.ts::test_non_json_error_keeps_the_raw_text",
+    "web/tests/auth.spec.ts::test_400_does_not_redirect",
+]
+evidence = "2026-11-04（格 7）。前端的 `api` 层原本有四份各自的 `handle`，差别都不是设计出来的：一份把响应体原文当错误消息（用户看见一整串 JSON）、一份不处理 204、一份不处理空 body。四份实现意味着「改一处」的定义是「记得改四处」，而 401 的处理挂在这四份里，漏掉的那一个就是「接口回 401、界面不跳」。现在统一成 `api/http.ts` 一份，401 只在一个地方触发，`src/session.ts` 装一次（清状态 → 跳登录页 → 带 redirect），**顺序不能换**：先跳后清的话，路由守卫会把这次跳转当成「已登录的合法导航」再放回来。删掉了一个真实存在的洞：`fetchMe` 在 404 时返回伪造的 `local` 用户——F1 落地前那是对的（那时确实没有身份端点），落地之后任何一次反代配置错误都会把它变成「所有人都是管理员」，而界面上一切正常。现在 404 就是一个普通失败。另加 `npm run typecheck` 进 CI（第 9 段）：vitest 用 esbuild 剥类型、不做类型检查，本格里有两次「字段名写错 / 导出没写出去」是 15 条 vitest 全绿、由 `vue-tsc` 抓出来的。改坏验证三组：登录发 `userName` / 401 不触发跳转 / 空 body 不特判 → 各自对应的那条红。"
+
+[[tool.agentworkbench.verification]]
+id = "I-V18"
+req = "REQ-AUTH-12 / §1.7 平台级配置的写"
+invariant = "界"
+claim = "`settings` 四条写入口（建供应商 / 激活 / 加模型 / 改 embedding 模型）对团队管理员 403 且三张配置表一字节不变；同一请求由平台所有者发出成功；两条读接口对两者都可用；不存在任何把 `is_platform_admin` 置 1 的接口"
+negative = "写入口只判登录不判平台所有者 → 任何成员加一条供应商再激活，全平台问答与检索片段都经他的机器，答案也由他决定，红；把 `is_platform_admin` 并进 `ROLE_RANK` 当第三档 → 「目标角色高于自己」那条判定会把管供应商的人误判成更高的团队角色，红；给一个 `PATCH /api/members/{id}/platform` 之类的授予入口 → 团队管理员自封，判据整体失效，红"
+status = "pass"
+tests = [
+    "tests/invariants/test_platform_admin.py::test_a_team_admin_cannot_write_any_platform_config",
+    "tests/invariants/test_platform_admin.py::test_the_platform_owner_can_write",
+    "tests/invariants/test_platform_admin.py::test_readers_stay_open_to_everyone_signed_in",
+    "tests/invariants/test_platform_admin.py::test_a_plain_member_is_refused_too",
+    "tests/invariants/test_platform_admin.py::test_the_refusal_is_recorded_with_its_own_reason",
+    "tests/invariants/test_platform_admin.py::test_the_check_happens_before_field_validation",
+    "tests/invariants/test_platform_admin.py::test_no_endpoint_can_hand_out_the_flag",
+    "tests/invariants/test_platform_admin.py::test_the_two_axes_do_not_imply_each_other",
+    "tests/invariants/test_platform_admin.py::test_the_owner_flag_comes_from_bootstrap_only",
+    "tests/invariants/test_platform_admin.py::test_an_old_database_gains_the_column_with_zero",
+    "tests/invariants/test_platform_admin.py::test_running_the_migration_twice_is_harmless",
+]
+evidence = "2026-11-04。这条判据不是从表格里来的，是从一次实读来的：`settings` 六条端点只要求登录，而 `providers`/`provider_models`/`system_state` 三张表没有团队列。两步就能把全平台流量导走——`POST /api/settings/providers` 建一条指向自己的供应商，再 `/activate`：此后所有问答的提问原文与检索片段都经那台机器，答案也由它决定。修的不是「漏了一个 if」，是**权限被放在了错误的轴上**：`role` 回答「在我这个团队里能管谁」，而这三张表不属于任何团队，所以第二个团队出现的那天「A 队管理员改 B 队供应商」会是一条合法操作。落地：`users.is_platform_admin`（迁移 0006，`ALTER TABLE` 前先 `pragma table_info` 探列——新库建表时列已在，直接 ALTER 会 `duplicate column name` 而服务起不来）；这一列**不进 `ROLE_RANK`**；`insert_user` 默认 `False`（默认写 True 会让每一次邀请都悄悄多一个所有者）；全仓唯一写 1 的地方是 `service.bootstrap`，**没有任何接口能授予**（有授予入口则团队管理员自封，判据整体归零）；四条写入口挂 `dependencies=[Depends(_platform_only)]`，读接口不动。两个测试发现：①「依赖先于 body 解析」这个说法只在**字段校验**意义上成立——畸形 JSON 在 `request.json()` 阶段就 422，比任何依赖都早，所以那条断言改成缺字段（`json={}`）而不是坏 JSON；②第一版「平台轴不参与等级」的测试是恒真式——它用 `role=member` 的 actor 走 `judge_management`，而第一条规则（`role is not ADMIN → 403`）在他身上就出局了，改坏等级判定也红不了。改成两个方向都断（能管供应商 ⟹ 不能管人，反之亦然），改坏验证才抓得住。改坏验证 9 组全红：依赖空转 / 按角色判 / 永远放行 / 建号默认所有者 / 引导不写所有者 / 平台标记顶替团队管理员 / 老库升级默认给成所有者 / 迁移不判列已存在 / 原因码用笼统的角色不足。"
+
+# ─────────────────────────────────────────────────────────────
+# 状态机登记表：每个状态机叫什么、状态集、真源在哪。
+# **合法迁移不在这里抄第二份**——两份迁移表必然漂移，而且漂移的表现是
+# "测试执行的那份是旧的"。登记表记「真源在哪个文件」，由闸门确认文件存在；
+# 迁移白名单由测试直接执行真源（F4 的做法）。
+# ─────────────────────────────────────────────────────────────
+
+[[tool.agentworkbench.state_machine]]
+name = "run_lifecycle"
+owner = "F4"
+states = "running, succeeded, failed, cancelled, limited, refused"
+source = "agentworkbench.core.runs"
+note = "合法迁移唯一真源是 core.runs.ALLOWED_TRANSITIONS。F6 只消费不扩建：REQ-19 的「提交与执行分离」是这条状态机的入口（POST /api/runs 建 running 行），不是新状态机。"
+
+[[tool.agentworkbench.state_machine]]
+name = "index_sync"
+owner = "F6"
+states = "ready, stale"
+source = "agentworkbench.db.repositories.system_state"
+note = "位，不是机：system_state 里 embedding.model（想要的）与 embedding.synced（索引实际用的）两值不同 = stale。stale → ready 只能由「索引重建完成」触发；检索层只读不写，所以 stale 时检索报错而不是顺手重建（重建是 F2 的重活，不能藏在一次检索里）。"
+
+[[tool.agentworkbench.state_machine]]
+name = "account_status"
+owner = "F1"
+states = "active, disabled"
+source = "agentworkbench.identity.policy"
+note = "两个状态，只有管理员能改。**与 lockout_until 刻意分开**：锁定是系统自动、到期自愈、不踢会话；停用是管理员手动、直到恢复、必须踢会话。合成一个 enabled 布尔会同时丢掉「谁改的」和「要不要踢下线」。迁移白名单在 policy 里，与 run_lifecycle 同样式。"
+
+[[tool.agentworkbench.state_machine]]
+name = "ticket_lifecycle"
+owner = "F1"
+states = "issued, revoked, expired"
+source = "agentworkbench.identity.policy"
+note = "票据（cookie 里那串明文，库里只存 SHA-256）。revoked 由登出、停用、改密、管理员重置触发；expired 是时间比较，不是写操作——所以「过期」不落 revoked_at，两者在库里可区分。credential_epoch 不是状态而是版本号：递增让旧版本票据全部失效；本人改密时当前这条跟着升版本，所以它活下来。"
+
+[[tool.agentworkbench.state_machine]]
+name = "invite_lifecycle"
+owner = "F1"
+states = "pending, accepted, expired"
+source = "agentworkbench.identity.policy"
+note = "一次性。accepted 与建号同一事务（否则并发两次都能建）；expired 同样是时间比较。用过的邀请第二次访问返回 404，与「不存在的邀请」逐字段相同——邀请 id 也是探针。"
+
+[[tool.agentworkbench.component]]
+capability = "切块"
+package = "chonkie"
+modules = ["chonkie"]
+status = "rejected"
+reason = "T-001 实测 5 组配置全不如现状：9.70 / 9.89 / 10.11 / 10.69 / 8.26% vs 7.29%。中文按字符级切，切点仍落在半句上。重开条件：T-001 上现有切块被证明是瓶颈（典型症状是答案跨切块边界、长文档召回明显低于短文档），用**同一题库**复测新版本且优于 7.29%——单纯「它发了新版本」不构成理由，实测数字才是。（2026-11-04 补重开条件，结论维持。）"
+
+[[tool.agentworkbench.component]]
+capability = "切块"
+package = "llama-index-core"
+modules = ["llama_index.core.node_parser", "llama_index.core"]
+status = "adopted"
+reason = "T-001 定案 + T-002 接入（2026-11-02）：SentenceSplitter 800/120 接缝率 7.52%，11 组里唯一追平 C# 基线（7.29%）；自写版实为 11.66%。题库 gold 已按内容对齐重标（questions-v2.json）。"
+
+# ── F3 §二「选用什么成熟组件」的登记。自写组件（两字切分、RRF 融合、LIKE 兜底、
+# 评测脚本）没有第三方包，不占条目；FTS5 走 sqlite3 标准库（登记反而触发
+# 「adopted 必须在 dependencies」——标准库不是依赖）。RGB 负拒绝子集是数据集
+# 不是包，CC BY-NC-SA 只能做评测、不能进交付物，见 evals/public/rgb/ 的说明。
+
+[[tool.agentworkbench.component]]
+capability = "语义路嵌入"
+package = "bge-m3"
+modules = ["FlagEmbedding", "sentence_transformers"]
+status = "planned"
+reason = "F3 §二定案的语义路组件（改写题唯一能救的一路）。用户已定：语义路后补——F3 第一阶段先建判定/引用/拒答层（不依赖语义路），嵌入作为独立一步接入 llm/embeddings.py 换掉 HashEmbedder。换模型 = 全库重算 + 两个阈值作废 + 重建评测基线，必须有独立步骤。包来源未定（FlagEmbedding / sentence-transformers / API 三选一，接入时定）。"
+
+[[tool.agentworkbench.component]]
+capability = "精排重排"
+package = "FlagEmbedding"
+modules = ["FlagEmbedding", "rerankers"]
+status = "planned"
+reason = "交叉编码器重排，F3 §二明写暂缓：等混合检索基线 + 消融（miss 是否集中在跨块题）。接入后排序与分数分布同时变，旧基线不可比——现在接等于同时改两个变量。bge-m3 若走 FlagEmbedding 加载，与语义路共用此包。"
+
+[[tool.agentworkbench.component]]
+capability = "指标外检"
+package = "ranx"
+modules = ["ranx", "ragas"]
+status = "planned"
+reason = "F3 §二：ranx（nDCG）/ RAGAS（faithfulness）做外部口径，检查自建指标是否系统性偏乐观。未接入；接入 = 双跑成本 + 口径解释成本，先有自建基线再说。许可 MIT / Apache-2.0（用前回源核实）。"
+
+[[tool.agentworkbench.component]]
+capability = "SSE 流式推送"
+package = "sse-starlette"
+modules = ["sse_starlette"]
+status = "planned"
+reason = "对话流的推送通道（api/routes/__init__ 已定：单向推送用 SSE，不用 WebSocket——省一套握手与重连语义）。前端移植时 SignalR 的 9 个 conn.on 换 addEventListener，事件名与 payload 不变。**F5 首版不接**（2026-11-03 定）：C-V5/C-V6 要的是「从库里读出当时的步骤」，一次 HTTP GET 就够；流式传输契约归 F6，在 F5 里接等于替 F6 选型。F6 接 SSE 时改 adopted。"
+
+[[tool.agentworkbench.component]]
+capability = "模型调用 SDK"
+package = "openai"
+modules = ["openai"]
+status = "adopted"
+reason = "F3 生成段已接入（2026-11-02）：与 C# ChatClientFactory 同构——base_url 覆盖指向任意 OpenAI 兼容端点，不区分厂商只认协议。供应商配置在库（providers/provider_models，C# 迁移的 zhipu/siliconflow 两家带密钥），激活端点 + 默认模型从库解析；未配置报 MODEL_NOT_CONFIGURED 不静默。core 层 forbidden_modules 仍含 openai（core 不许碰模型）。"
+
+[[tool.agentworkbench.component]]
+capability = "口令哈希"
+package = "pwdlib"
+modules = ["pwdlib"]
+status = "adopted"
+reason = "F1 §1.2 口令哈希。选它而不是直接调 argon2-cffi：`verify_and_update` 一步完成「验证 + 需要时重哈希」，参数随硬件调高后存量哈希能在下次登录时平滑升级——没有这一步，「参数随硬件可调」那句话兑现不了，存量会永远停在部署当天的强度上。FastAPI 官方文档当前推荐的正是 pwdlib[argon2]（passlib 已不再推荐）。**踩过一次**：pwdlib 0.3.1 没有 `check_needs_rehash`（那是 passlib 的 API），且 `verify` 对无法识别的哈希抛 `UnknownHashError` 而不是返回 False——两点都已按实测改正。"
+
+[[tool.agentworkbench.component]]
+capability = "用户管理框架"
+package = "fastapi-users"
+modules = ["fastapi_users"]
+status = "rejected"
+reason = "F1 的 14 条 REQ 里它能独立完成 2 项（登录、登出）、另 2 项给一半（停用拦得住新登录但踢不掉已签发会话；改密重置哈希但不吊销其他会话），其余 16 项——团队隔离、资源归属、拒绝记录、判定顺序——全在「你自己的表」上，任何身份框架都碰不到。接它的代价是三条硬冲突：① 强制 SQLAlchemy ORM（本项目裸 sqlite3 + 手写 DDL）② `is_active` 单布尔，正是 §1.4 明令禁止的合并 ③ 无状态 JWT 不可撤销，要撤销得换 DatabaseStrategy，那时它的价值只剩两个端点。另：2026-03 起已进入 maintenance mode（只收安全与依赖更新）。重开条件：出现「两周内必须交出一套带邮箱验证与自助找回的账号系统」这种排期，且团队接受引入 ORM。（2026-11-04 在「有标准形态就用库」这条原则下定案，逐条复核后维持。）"
+
+[[tool.agentworkbench.component]]
+capability = "无状态令牌"
+package = "PyJWT"
+modules = ["jwt"]
+status = "rejected"
+reason = "AUTH-08 / 09 要求「凭据变更后旧会话在窗口内失效」。无状态 JWT 在设计上不可撤销——只能等过期，或者额外维护一张黑名单表（那已经是有状态，绕一圈回到不透明票据）。本项目用随机串 + 库里存 SHA-256，撤销就是一行 UPDATE，且备份泄露不等于会话可复用。重开条件：出现「令牌要发给第三方服务、且对方无法回源校验」的场景。（2026-11-04 在「有标准形态就用库」这条原则下定案，逐条复核后维持。）"
+
+[[tool.agentworkbench.component]]
+capability = "授权策略引擎"
+package = "casbin"
+modules = ["casbin"]
+status = "rejected"
+reason = "F1 只有一维边界（团队）+ 两个角色（admin / member），judge_* 纯函数二十行判完。Casbin 的价值在「角色 × 资源状态 × 环境」的组合爆炸；用它等于给二维问题上一套策略引擎，还要自己建策略表、自己写审计（它不提供审计）。重开条件见 F1 §4：出现真实的文档级授权需求，且能接受「每个入口都测」的预算。（2026-11-04 在「有标准形态就用库」这条原则下定案，逐条复核后维持。）"
+
+[[tool.agentworkbench.component]]
+capability = "外部身份服务"
+package = "ory-kratos"
+modules = []
+status = "rejected"
+reason = "Kratos / Zitadel / Authentik 这类自托管身份服务确实能覆盖登录、锁定、停用、会话管理与邀请的大部分工作，是本域唯一「真能省事」的选项——它不是库，是一个进程。不引的理由是部署面：多一个进程、一套独立 SQL 与迁移、一条新的故障链，私有化交付时多一个要现场排查的组件。重开条件：客户要求对接企业 IdP（SSO）时，它就是正解而不是可选项。（2026-11-04 在「有标准形态就用库」这条原则下定案，逐条复核后维持。）"
+
+[[tool.agentworkbench.component]]
+capability = "行级安全策略（多团队隔离）"
+package = "postgresql"
+modules = []
+status = "rejected"
+reason = "**这是「边界最难处理」在行业里的标准答案，而 SQLite 没有等价物**：PostgreSQL 的行级安全策略把「只能看到本团队的行」写成数据库策略，应用层漏写一个 where 也拿不到别人的数据——隔离从「每个入口都要记得」变成「库强制」。不用的理由只有一条，但很硬：本项目是单机私有化交付（一个进程 + 一个 SQLite 文件），引入 PostgreSQL 等于把部署从「拷一个目录」变成「装一个数据库服务」，与产品形态冲突。退而求其次的是 F1 选的替代：归属过滤写进 SQL，且所有权参数**无默认值**（`insert_message(conn, owner, ...)`——少传一个是 TypeError，不是漏过滤），代价是它靠签名与测试保证，不靠库强制。重开条件：产品转向多租户 SaaS（一个实例服务多个客户）、或客户环境已有 PostgreSQL 并要求等保级隔离审计时，这一条从 rejected 直接翻成必选——届时 65 处仓储里的 where 可以整体撤掉换成策略。"
+
+
+[project.optional-dependencies]
+# 版本写死，不用范围。范围迟早会解析出两个不同的环境，而"我这能跑"是最烧时间的 bug。
+dev = [
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+    "import-linter==2.15",
+    "pytest==9.2.0",
+    "pytest-asyncio==1.4.1",
+    "pytest-cov==7.1.0",
+    "pytest-timeout==2.4.0",
+    "pre-commit==4.7.0",
+    "deptry==0.25.1",
+    "pip-audit==2.10.1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ─────────────────────────────────────────────────────────────
+# 规则源：ruff 是「代码规范」的唯一执行点。
+# 改这一段等于改规范，改规范要写明理由（tests/test_gates.py 会盯住它）。
+# ─────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# 目录级豁免只有两处，都是外部代码：
+#   evals/self/        —— 从 C# 仓库原样搬来的 5 个评测脚本，要能逐字节对账
+#   evals/public/rgb   —— RGB 基准官方实现，原样保留，不改
+# 自己写的代码永远不在这里，test_gates 会盯住。
+extend-exclude = ["evals/self", "evals/public/rgb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "PGH", "S", "RUF", "ASYNC", "T20"]
+# RUF001/002/003：中文文档与注释里全角标点（：，、）是正确写法，不是"歧义字符"。
+# 关掉它们是因为规则假设了英文语境，不是因为我们想少检查。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+# 豁免必须写明归属，不允许全局关规则。
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]              # 测试里 assert 是断言，不是安全风险
+"scripts/*" = ["S603", "S607", "T20"]  # CI 脚本本来就要调外部命令并打印
+"evals/*" = ["T20", "S603"]       # print 是 CLI 的输出方式；subprocess 只调本仓脚本、无 shell
+"evals/run_rag_eval_v2.py" = ["T20", "S608"]  # vendored 副本（与 self 原版只差题库路径），豁免随原件
+"src/agentworkbench/cli.py" = ["T20"]  # CLI 的启动横幅就该打在 stdout 上——uvicorn 自己也这么干
+
+# ─────────────────────────────────────────────────────────────
+# 类型：mypy 是唯一的类型裁决者。不要在编辑器里再挂一个 pyright 当闸门。
+# ─────────────────────────────────────────────────────────────
+[tool.mypy]
+files = ["src", "evals", "tests"]
+mypy_path = "src"
+python_version = "3.13"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# evals/self/ 是原样搬迁的评测脚本，39 条类型错误全在第三方代码里。
+# 类型检查的价值在于「改的时候被拦」，不改的代码被拦一次就够了。
+# run_rag_eval_v2.py 是 self 原件的副本（只差题库路径），豁免口径随原件。
+exclude = ["^evals/self/", "^evals/public/rgb/", "^evals/run_rag_eval_v2.py"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "evals.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+
+# ─────────────────────────────────────────────────────────────
+# 依赖边界：这里是 pyproject 版的 ProjectReference。
+# layers 从上到下 = 上层可依赖下层；同一行用 | 分隔的包彼此独立。
+# ─────────────────────────────────────────────────────────────
+[tool.importlinter]
+root_packages = ["agentworkbench"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "分层：api → 编排 → 能力 → 基础设施 → core"
+type = "layers"
+# guard 在能力层（2026-11-02 调整）：F3 的四段编排（agent.runner）要调判定、
+# 否决、引用校验——编排层调能力层，方向与 C# AgentHarness → Knowledge.Local 一致。
+# 原分层把 guard 与 agent 同层（F2 时 guard 还是空骨架，未考虑编排）。
+layers = [
+    "agentworkbench.api",
+    "agentworkbench.agent | agentworkbench.chat | agentworkbench.ingest | agentworkbench.identity",
+    "agentworkbench.rag | agentworkbench.guard | agentworkbench.trace",
+    "agentworkbench.db | agentworkbench.llm",
+    "agentworkbench.core | agentworkbench.config",
+]
+
+[[tool.importlinter.contracts]]
+name = "identity 内部分层：编排 → 存储/凭证 → 纯函数"
+type = "layers"
+# 这个包是**纵向**切的（2026-11-04 定）。别的域按层横向散在 core / db / api 里；
+# identity 横切每一个请求，所以让「一个域一个目录」读完。
+#
+# 包内仍然单向。反过来的例子与代价：
+# - policy import store → 判定没法在无库环境里测，而那正是它存在的理由
+#   （F1 的判定要能对着一堆构造出来的 User/Session 跑，不建库）。
+# - store import policy → 「能不能」和「有没有」混在一层，SQL 里出现 if 分支，
+#   而 SQL 里的分支是测试最难覆盖的那种。
+layers = [
+    "agentworkbench.identity.service",
+    "agentworkbench.identity.store | agentworkbench.identity.credentials",
+    # sessions 与 policy 同层：两者都只依赖 models，谁也不该 import 对方。
+    # 放进同一层是为了让「service 可以用它、它不能反过来调 service」成为被检查的事实。
+    "agentworkbench.identity.policy | agentworkbench.identity.sessions",
+    "agentworkbench.identity.models",
+]
+
+[[tool.importlinter.contracts]]
+name = "identity.policy 与 models 是叶子：不碰 IO、不碰第三方"
+type = "forbidden"
+# 2026-11-04 补这条，因为改坏验证抓出一个洞：外层 layers 只能管到「包」这一级，
+# identity 整体在 db 之上，于是 `policy` import `db.engine` 是合法的——
+# 而 policy 的整个存在理由就是「不建库也能测判定」。
+# 包的层级管不到模块级，只能单独禁一次。
+#
+# forbidden 里列 sqlite3 而不是只列 agentworkbench.db：直接 `import sqlite3`
+# 同样会让判定离不开环境，而且更隐蔽。
+source_modules = [
+    "agentworkbench.identity.policy",
+    "agentworkbench.identity.models",
+]
+forbidden_modules = [
+    "agentworkbench.db",
+    "agentworkbench.llm",
+    "agentworkbench.api",
+    "agentworkbench.agent",
+    "agentworkbench.chat",
+    "agentworkbench.trace",
+    "agentworkbench.rag",
+    "agentworkbench.guard",
+    "agentworkbench.ingest",
+    "sqlite3",
+    "fastapi",
+    "starlette",
+    "pydantic",
+    "pwdlib",
+]
+
+[[tool.importlinter.contracts]]
+name = "core 不依赖任何其他包"
+type = "forbidden"
+source_modules = ["agentworkbench.core"]
+forbidden_modules = [
+    "agentworkbench.api",
+    "agentworkbench.agent",
+    "agentworkbench.chat",
+    "agentworkbench.ingest",
+    "agentworkbench.guard",
+    "agentworkbench.rag",
+    "agentworkbench.trace",
+    "agentworkbench.db",
+    "agentworkbench.llm",
+]
+
+[[tool.importlinter.contracts]]
+name = "core 只用标准库，不 import 任何第三方"
+type = "forbidden"
+source_modules = ["agentworkbench.core"]
+# 逐项列出，不用通配：通配会把以后新加的库一并禁掉，看起来更严，实际是没人再改它。
+forbidden_modules = [
+    "fastapi",
+    "starlette",
+    "pydantic",
+    "pydantic_settings",
+    "sqlalchemy",
+    "alembic",
+    "chonkie",
+    "pypdf",
+    "openai",
+    "httpx",
+    "structlog",
+    "huey",
+    "sse_starlette",
+    "tenacity",
+    "sqlite_vec",
+]
+
+# ─────────────────────────────────────────────────────────────
+# 测试
+# ─────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers --strict-config"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "invariant: 一条不变量的验证——被改坏时必须变红",
+    "slow: 单条超过 1 秒",
+    "eval: 需要题库与指标，不进日常 CI",
+]
+
+# ─────────────────────────────────────────────────────────────
+# 依赖卫生
+# ─────────────────────────────────────────────────────────────
+# 双向校验：import 了没声明 → DEP001；声明了没 import → DEP002。
+# 这条就是「不许自己搓」的部分机械保证：手写了本该调库的代码，声明的依赖会变空转。
+[tool.deptry]
+extend_exclude = [
+    "evals/self",     # vendored，原样搬迁
+    "evals/public",   # 外部基准，原样保留
+    "evals/spikes",   # 一次性探针，不进 CI
+]
+
+[tool.deptry.per_rule_ignores]
+# 自引用不是"传递依赖"问题：`agentworkbench.*` 就是本仓自己的包。
+DEP003 = ["agentworkbench"]
+# dev 工具是「跑的工具」，本来就不该被业务代码 import，不是未使用依赖。
+DEP002 = [
+    "ruff",
+    "mypy",
+    "import-linter",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-timeout",
+    "pre-commit",
+    "deptry",
+    "pip-audit",
+    "uvicorn",  # ASGI 运行时：`uvicorn agentworkbench.api.app:app` 启动，不进业务代码
+    "python-multipart",  # fastapi 的 multipart 解析在其内部 import，本仓源码里看不到
+]

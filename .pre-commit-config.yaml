@@ -1,0 +1,10 @@
+# 提交前那道闸：只跑 ruff，目标 1 秒内结束。
+# 慢闸门等于没有闸门——超过 3 秒，人就会开始 --no-verify。
+# 全量检查（类型、边界、测试）在 python scripts/ci.py check 里，不进这里。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
