@@ -29,6 +29,11 @@ data/
 # 验收证据：每次执行的原始输出不进版本库
 reports/
 
+# 覆盖率数据
+.coverage
+.coverage.*
+htmlcov/
+
 # 内部工作笔记与 AI 协作记忆：不发布
 .workbuddy/
 
