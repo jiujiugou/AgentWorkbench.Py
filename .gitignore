@@ -12,3 +12,25 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+
+# 评测：库副本（10MB 二进制）与逐次原始输出都不进版本库，
+# 进版本库的只有 evals/baseline.json——那才是"当前标准"。
+evals/fixtures/
+evals/reports/
+
+# sqlite 打开后生成的旁路文件
+*.db-shm
+*.db-wal
+*.db-journal
+
+# 本地运行时产物：库文件与上传的文件
+data/
+
+# 内部工作笔记与 AI 协作记忆：不发布
+.workbuddy/
+
+# 临时备份文件
+*.orig
+
+# import-linter 缓存
+.import_linter_cache/
