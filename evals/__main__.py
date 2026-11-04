@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -36,6 +37,10 @@ REPORT_DIR = EVALS / "reports"
 
 def _run(script: str, *args: str) -> tuple[int, str]:
     """跑一个脚本，返回（退出码，stdout+stderr）。不抛异常：评测失败也要留下输出。"""
+    # 子进程的输出必须强制 UTF-8：Windows 下 stdout 被管道接走时默认用 GBK，
+    # 而这里按 UTF-8 解码，中文标签会变成替换字符，`合计` 行永远匹配不上，
+    # 结果是「脚本跑成功、解析器报 overall=None」。PYTHONUTF8 兜住 C 层输出。
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     proc = subprocess.run(
         [sys.executable, script, *args],
         cwd=SELF,
@@ -45,6 +50,7 @@ def _run(script: str, *args: str) -> tuple[int, str]:
         errors="replace",
         timeout=600,
         check=False,
+        env=env,
     )
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
@@ -200,6 +206,12 @@ def cmd_run(write: bool) -> int:
     for key, text in raw.items():
         (REPORT_DIR / f"{key}.txt").write_text(text, encoding="utf-8")
 
+    # 入口坏了就到此为止：下面要解引用 overall / negative，先返回才能给出
+    # 「评测入口故障」这句人话，而不是一个 TypeError 栈。
+    if crashed:
+        print(f"评测入口故障：{crashed}", file=sys.stderr)
+        return 1
+
     result: dict[str, Any] = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "duration_seconds": round(time.time() - started, 1),
@@ -226,10 +238,6 @@ def cmd_run(write: bool) -> int:
         print(f"基线已写入 {BASELINE.relative_to(EVALS.parent)}")
     else:
         print("（--no-write：未覆盖基线）")
-
-    if crashed:
-        print(f"评测入口故障：{crashed}", file=sys.stderr)
-        return 1
     return 0
 
 
