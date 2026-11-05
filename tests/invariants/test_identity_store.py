@@ -84,6 +84,29 @@ def test_all_five_tables_exist(conn: sqlite3.Connection) -> None:
     assert {"tenants", "users", "tickets", "invites", "identity_events"} <= names
 
 
+def test_must_change_password_is_explicit_and_defaults_to_false(conn: sqlite3.Connection) -> None:
+    """首登改密标记是**库里的一列**，不是从 epoch / 平台标记推断出来的。
+
+    推断的版本今天能过，但重置口令会把 epoch 加一，于是“还没改初始口令”这个事实
+    被一个无关的版本号顺手抹掉；而这一列不会。默认 0 是判据：存量账号升级后
+    不能被误伤成“所有人都必须先改密”。
+    """
+    tenant_id = make_tenant(conn)
+    user_id = make_user(conn, tenant_id)
+
+    account = store.get_user(conn, user_id)
+    assert account is not None
+    assert account.must_change_password is False
+
+    assert store.set_must_change_password(conn, user_id, required=True, now=NOW) is True
+    marked = store.get_user(conn, user_id)
+    assert marked is not None and marked.must_change_password is True
+
+    assert store.set_must_change_password(conn, user_id, required=False, now=NOW) is True
+    cleared = store.get_user(conn, user_id)
+    assert cleared is not None and cleared.must_change_password is False
+
+
 def test_email_is_unique_across_the_whole_table(conn: sqlite3.Connection) -> None:
     """邮箱**全局**唯一，不是团队内唯一。
 

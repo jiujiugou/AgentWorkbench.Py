@@ -157,3 +157,66 @@ def resolve_active_row(conn: sqlite3.Connection) -> sqlite3.Row:
             f"激活供应商 {row['name']} 没有配置 api_key：请在供应商设置里填写凭据。",
         )
     return cast(sqlite3.Row, row)
+
+
+def get_provider(conn: sqlite3.Connection, provider_id: int) -> sqlite3.Row | None:
+    """按 id 取一行（密文列照给，由路由的白名单 DTO 决定出不出去）。"""
+    row = conn.execute("select * from providers where id = ?", (provider_id,)).fetchone()
+    return cast(sqlite3.Row | None, row)
+
+
+def list_models(conn: sqlite3.Connection, provider_id: int) -> list[sqlite3.Row]:
+    return cast(
+        list[sqlite3.Row],
+        conn.execute(
+            "select * from provider_models where provider_id = ? order by id", (provider_id,)
+        ).fetchall(),
+    )
+
+
+def get_model(conn: sqlite3.Connection, model_id: int) -> sqlite3.Row | None:
+    row = conn.execute("select * from provider_models where id = ?", (model_id,)).fetchone()
+    return cast(sqlite3.Row | None, row)
+
+
+def update_provider(
+    conn: sqlite3.Connection,
+    *,
+    provider_id: int,
+    name: str,
+    base_url: str,
+    api_key_encrypted: str,
+    now: str,
+) -> bool:
+    """改名称 / 地址 / 凭据。
+
+    `api_key_encrypted` 传**空串**表示这次不动凭据（前端把"没填"当成"不改"，
+    与「清空钥匙」区分开——后者是"配了个不支持鉴权的本地端点"，走的是重新保存
+    空串那条路，不是这里）。
+    """
+    with conn:
+        if api_key_encrypted:
+            cur = conn.execute(
+                "update providers set name = ?, base_url = ?, api_key_encrypted = ?,"
+                " updated_at = ? where id = ?",
+                (name, base_url, api_key_encrypted, now, provider_id),
+            )
+        else:
+            cur = conn.execute(
+                "update providers set name = ?, base_url = ?, updated_at = ? where id = ?",
+                (name, base_url, now, provider_id),
+            )
+    return cur.rowcount > 0
+
+
+def delete_provider(conn: sqlite3.Connection, provider_id: int) -> bool:
+    """删供应商。`provider_models` 由外键 CASCADE 跟着走（连接上 `foreign_keys=on`）。"""
+    with conn:
+        cur = conn.execute("delete from providers where id = ?", (provider_id,))
+    return cur.rowcount > 0
+
+
+def delete_model(conn: sqlite3.Connection, model_id: int) -> bool:
+    with conn:
+        cur = conn.execute("delete from provider_models where id = ?", (model_id,))
+    return cur.rowcount > 0

@@ -64,3 +64,85 @@ def test_suffix_case_insensitive() -> None:
 def test_no_file_beats_everything() -> None:
     """四种问题叠在一起，只能报最基础的那个。"""
     assert judge_upload(filename=None, size_bytes=0, max_bytes=0) is UploadRejectCode.NO_FILE
+
+
+def test_the_frontend_accepts_exactly_what_the_backend_takes() -> None:
+    """前端的 `ACCEPT_EXTS` 必须与后端白名单**逐个相等**。
+
+    D7 UI 验收抓到的真缺陷：前端写的是 `['.pdf', '.txt', '.md', '.json']`，后端收
+    `{.pdf, .docx, .xlsx}`。两个方向都错——Word / Excel 在界面上**根本传不上去**
+    （被前端挡下并提示"仅支持 PDF / TXT / MD / JSON"），而 TXT / MD / JSON 放行之后
+    被后端 400 拒。用户看到的是"这个系统不支持 Word"，而代码里明明支持。
+
+    这条测试**读前端源码**：跨语言的两份常量没有任何编译器能对上，只有一条
+    会失败的断言能。改坏任一侧 → 红。
+    """
+    import re
+    from pathlib import Path
+
+    from agentworkbench.ingest.upload import DEFAULT_ALLOWED_SUFFIXES
+
+    source = (
+        Path(__file__).resolve().parents[2] / "web" / "src" / "api" / "documents.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(r"export const ACCEPT_EXTS = \[(.*?)\]", source, re.S)
+    assert match is not None, "前端找不到 ACCEPT_EXTS——它被改名或挪走了，这条契约就断了"
+
+    frontend = {item.strip().strip("'\"") for item in match.group(1).split(",") if item.strip()}
+    assert frontend == set(DEFAULT_ALLOWED_SUFFIXES), (
+        f"前后端接受的文件类型不一致：前端 {sorted(frontend)}，"
+        f"后端 {sorted(DEFAULT_ALLOWED_SUFFIXES)}"
+    )
+
+
+# ── D9：上限要在**读之前**生效，而不是读完再判 ──
+
+
+class _EndlessStream:
+    """一个无限的字节流，记录被读走了多少。
+
+    用它而不是真的 100MB 字节串：要验的是「读到什么时候就停」，不是「能不能读完」。
+    """
+
+    def __init__(self) -> None:
+        self.read_bytes = 0
+
+    def read(self, size: int) -> bytes:
+        self.read_bytes += size
+        return b"x" * size
+
+
+def test_the_reader_stops_at_the_limit_instead_of_buffering_everything() -> None:
+    """超限时最多读到「上限 + 一块」，而不是整份读进内存再判。
+
+    改坏这里会怎样：退回 `data = file.file.read()` 的写法，一个 100MB 的请求
+    会把服务端 RSS 抬起 107MB 才回 400——「被拒之前先把内存占了」。
+    D9 红队 C 的 R-02 就是这条，`scripts/repro/r04_upload_resource.py` 可复跑。
+    """
+    from agentworkbench.api.errors import UploadRejected
+    from agentworkbench.api.routes.documents import _READ_CHUNK, _read_with_limit
+
+    stream = _EndlessStream()
+    limit = 4 * 1024 * 1024
+
+    with pytest.raises(UploadRejected) as caught:
+        _read_with_limit(stream, limit)  # type: ignore[arg-type]
+
+    assert caught.value.code is UploadRejectCode.FILE_TOO_LARGE
+    assert stream.read_bytes <= limit + _READ_CHUNK, (
+        f"读了 {stream.read_bytes} 字节才停——上限是 {limit}"
+    )
+
+
+def test_the_reader_keeps_content_under_the_limit_intact() -> None:
+    """没超限时逐字节原样返回——有上限的读不能把内容改掉。
+
+    `file.file` 是二进制流，分块拼接写错一个 `extend`/`append` 就会把 bytes 变成
+    "bytes 的列表"，而那要到解析阶段才炸，且错误信息完全不指向这里。
+    """
+    from io import BytesIO
+
+    from agentworkbench.api.routes.documents import _read_with_limit
+
+    payload = "液压站 E2 报警".encode() * 1000
+    assert _read_with_limit(BytesIO(payload), len(payload)) == payload

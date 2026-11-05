@@ -74,6 +74,7 @@ _RESOURCE_KINDS: Final[dict[str, str]] = {
 _FALLBACK_REASON: Final[dict[ErrorCode, ReasonCode]] = {
     ErrorCode.NOT_AUTHENTICATED: ReasonCode.UNAUTHENTICATED,
     ErrorCode.FORBIDDEN: ReasonCode.ROLE_INSUFFICIENT,
+    ErrorCode.PASSWORD_CHANGE_REQUIRED: ReasonCode.PASSWORD_CHANGE_REQUIRED,
     # 404 只有一个理由：对你不可见。它同时覆盖「不存在」与「属于别人」——
     # 路由按团队条件查，本来就分不出这两者（见 `ReasonCode.RESOURCE_MISSING`）。
     ErrorCode.NOT_FOUND: ReasonCode.RESOURCE_MISSING,

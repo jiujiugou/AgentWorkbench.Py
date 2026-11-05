@@ -89,11 +89,16 @@ def open_conn(app: FastAPI) -> sqlite3.Connection:
     return deps.open_conn()
 
 
-def seed_admin(app: FastAPI) -> service.BootstrapResult:
+def seed_admin(app: FastAPI, *, must_change_password: bool = False) -> service.BootstrapResult:
     conn = open_conn(app)
     try:
         return service.bootstrap(
-            conn, email=ADMIN_EMAIL, password=PASSWORD, tenant_name="团队甲", now=NOW
+            conn,
+            email=ADMIN_EMAIL,
+            password=PASSWORD,
+            tenant_name="团队甲",
+            now=NOW,
+            must_change_password=must_change_password,
         )
     finally:
         conn.close()
@@ -124,7 +129,7 @@ def login(client: TestClient, *, email: str = ADMIN_EMAIL, password: str = PASSW
 
 def concrete(path: str) -> str:
     """把 `{doc_id}` 换成一段真实形态的 id。**不是空串**：空串会被路由的
-    类型转换或校验挡下（422），而那样一来「401」这条断言就没验到闸门。"""
+    类型转换或校验挡下（400），而那样一来「401」这条断言就没验到闸门。"""
     return re.sub(r"\{[^}]+\}", "00000000-0000-0000-0000-000000000000", path)
 
 
@@ -179,6 +184,41 @@ def test_a_route_added_after_create_app_is_still_gated(app: FastAPI) -> None:
         assert client.get("/api/late-arrival").status_code == 401
 
 
+def test_must_change_blocks_a_route_added_after_create_app(
+    app: FastAPI, client: TestClient
+) -> None:
+    """首登闸门也在 app 级依赖里：**第 22 条路由**同样挡得住。
+
+    只测已存在的 `/api/documents` 不够——把闸门写成“每条路由自己判”的版本，
+    现有路由全绿，新路由静默开放，而首登口令正是最不该漏的那一条。
+    """
+    seed_admin(app, must_change_password=True)
+    assert login(client).status_code == 200
+
+    @app.get("/api/late-arrival-must-change")
+    def late_arrival() -> dict[str, bool]:
+        return {"ok": True}
+
+    response = client.get("/api/late-arrival-must-change")
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "password_change_required"
+
+
+def test_must_change_403_is_recorded_with_its_own_reason(app: FastAPI, client: TestClient) -> None:
+    """被首登闸门挡下的请求也要留记录，原因码不能兜底成“角色不足”。"""
+    seed_admin(app, must_change_password=True)
+    assert login(client).status_code == 200
+
+    response = client.get("/api/documents")
+    assert response.status_code == 403
+    request_id = response.headers["x-request-id"]
+
+    rows = [row for row in events(app) if row["request_id"] == request_id]
+    assert len(rows) == 1
+    assert rows[0]["reason_code"] == "password_change_required"
+
+
 EXPECTED_PUBLIC_PATHS = frozenset(
     {
         "/api/health",
@@ -225,15 +265,16 @@ def test_the_whitelist_is_reachable_without_a_session(client: TestClient) -> Non
 
 
 def test_the_gate_runs_before_the_body_is_validated(client: TestClient) -> None:
-    """无票据 + 空 body 的 POST 返回 401，不是 422。
+    """无票据 + 空 body 的 POST 返回 401，不是 400。
 
-    顺序不是细节：422 会告诉未登录的人「这个端点存在，而且它要一个字段」，
+    顺序不是细节：校验失败会告诉未登录的人「这个端点存在，而且它要一个字段」，
     而 401 什么都不说。实现上它靠的是「依赖先于请求体校验」——那是可以被一次
     改造不经意改掉的（比如把校验挪进路由函数）。
 
-    **只断言空 body**：body 是**非法 JSON** 时，FastAPI 在解析阶段就抛 422，
+    **只断言空 body**：body 是**非法 JSON** 时，FastAPI 在解析阶段就失败，
     早于任何依赖。那是框架行为，不是本项目的选择；把它写成断言等于把一处分不清
-    「端点存在」的响应固化成规格。
+    「端点存在」的响应固化成规格。（D6 之后这类请求回 400 五字段信封，状态码从
+    422 改成了 400，但「校验先于闸门」这件事没变。）
     """
     assert client.post("/api/documents").status_code == 401
     assert client.patch("/api/members/someone").status_code == 401
@@ -596,3 +637,170 @@ def test_the_cache_is_bounded() -> None:
 
     assert len(cache._entries) <= MAX_ENTRIES
     assert cache.get("overflow") is not None
+
+
+# ── 吊销的即时性（D9 红队抓到的窗口） ──
+
+
+def test_the_default_configuration_does_not_cache_session_judgments() -> None:
+    """默认 `session_invalidate_seconds = 0`。
+
+    这条守的是一个**默认值**，看起来像废话，但 D9 之前它正是 60：本地 SQLite 上一次
+    判定是几十微秒，60 秒窗口换来的是「被停用的管理员在一个窗口内还能改别人的角色」——
+    窗口是临时的，那次改角色的结果不是。而 794 个测试全绿，因为
+    `tests/conftest.py` 把这条旋钮设成了 0：**测试环境从来没有跑过生产默认值**。
+
+    改回 60 会让这条红。真要窗口，改这个断言并在 `identity/sessions.py` 里
+    重新说明代价——两件事必须同时发生。
+
+    **断言的是「类上声明的默认值」，不是 `Settings()` 跑出来的值**：
+    `tests/conftest.py` 把 `AWB_AUTH__SESSION_INVALIDATE_SECONDS` 固定成 `0`，
+    于是 `Settings()` 无论代码默认写成多少都会读到 0。第一版就是这么写的，
+    改坏验证时把默认改回 60 它**照样绿**——一个永远不会红的空测试。
+    同一个陷阱还解释了为什么 D9 之前 794 个测试全绿却漏掉了这条缺陷：
+    测试环境从来没有跑过生产默认值。
+    """
+    declared = AuthSettings.model_fields["session_invalidate_seconds"].default
+    assert declared == 0, f"代码里的默认值被改成了 {declared}"
+
+    # 顺带确认「测试环境确实把旋钮钉成 0」这个前提还成立——它一旦变了，
+    # 上面那句的解释就不再成立，而这里会先红。
+    assert Settings(data_dir=Path(".")).auth.session_invalidate_seconds == 0
+
+
+def test_disabling_a_member_kicks_the_session_out_on_the_very_next_request(
+    tmp_path: Path,
+) -> None:
+    """停用之后**下一个请求**就 401，即使缓存窗口是 60 秒。
+
+    改坏这里会怎样：把 `forget_user` 去掉，这条在窗口内会拿到 200——
+    而现实中那 60 秒里被停用的管理员还能改别人的角色，改动是永久的。
+    红队两个小组各自独立复现过（`reports/acceptance/2026-11-05/d9/redteam-A.md` R-01）。
+    """
+    app = build_app(tmp_path, session_window=60)
+    with (
+        TestClient(app, raise_server_exceptions=False) as admin_client,
+        TestClient(app, raise_server_exceptions=False) as member_client,
+    ):
+        seeded = seed_admin(app)
+        member_id = seed_member(app, tenant_id=seeded.tenant_id, admin_id=seeded.user_id)
+        login(admin_client)
+        login(member_client, email=MEMBER_EMAIL)
+
+        # 先请求一次，让这张票进缓存——否则测的是「没缓存」而不是「缓存被清掉」
+        assert member_client.get("/api/documents").status_code == 200
+
+        assert admin_client.post(f"/api/members/{member_id}/disable").status_code == 204
+
+        assert member_client.get("/api/documents").status_code == 401
+
+
+def test_logout_invalidates_the_ticket_even_inside_a_window(tmp_path: Path) -> None:
+    """登出后重放同一个 cookie → 401。缓存窗口不影响这条。"""
+    app = build_app(tmp_path, session_window=60)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        seed_admin(app)
+        login(client)
+        assert client.get("/api/auth/me").status_code == 200  # 预热缓存
+
+        ticket = client.cookies.get(COOKIE_NAME)
+        assert ticket, "登录后应该有 awb_session cookie"
+        assert client.post("/api/auth/logout").status_code == 204
+
+        replay = client.get("/api/auth/me", headers={"cookie": f"{COOKIE_NAME}={ticket}"})
+        assert replay.status_code == 401, "登出后同一张票还能用——缓存把吊销吞掉了"
+
+
+def test_changing_the_password_kills_the_other_device_immediately(tmp_path: Path) -> None:
+    """改密：当前设备保住，别的设备**立刻**失效（`I-V9`），不等窗口。"""
+    app = build_app(tmp_path, session_window=60)
+    with (
+        TestClient(app, raise_server_exceptions=False) as device_one,
+        TestClient(app, raise_server_exceptions=False) as device_two,
+    ):
+        seed_admin(app)
+        login(device_one)
+        login(device_two)
+
+        assert device_two.get("/api/auth/me").status_code == 200  # 预热缓存
+
+        changed = device_one.post(
+            "/api/auth/password",
+            json={"oldPassword": PASSWORD, "newPassword": PASSWORD + "-new"},
+        )
+        assert changed.status_code == 204, changed.text
+
+        assert device_one.get("/api/auth/me").status_code == 200, "当前设备不该被踢"
+        assert device_two.get("/api/auth/me").status_code == 401, "另一台设备还在放行"
+
+
+def test_a_role_change_takes_effect_on_the_next_request(tmp_path: Path) -> None:
+    """降职之后下一次请求就按新角色判——缓存里那份 `Principal` 还带着旧角色。"""
+    app = build_app(tmp_path, session_window=60)
+    with (
+        TestClient(app, raise_server_exceptions=False) as owner_client,
+        TestClient(app, raise_server_exceptions=False) as peer_client,
+    ):
+        seeded = seed_admin(app)
+        conn = open_conn(app)
+        try:
+            _, token = service.create_invite(
+                conn,
+                tenant_id=seeded.tenant_id,
+                role=Role.ADMIN,
+                created_by=seeded.user_id,
+                now=NOW,
+            )
+            peer = service.accept_invite(
+                conn,
+                token=token,
+                email="peer@example.com",
+                password=PASSWORD,
+                now=NOW,
+                config=service.AuthConfig(),
+            )
+        finally:
+            conn.close()
+
+        login(owner_client)
+        login(peer_client, email="peer@example.com")
+        # 预热：peer 以管理员身份进缓存。用 `GET /api/members` 是因为它**不判管理员**
+        # （成员可见），正好只用来把这张票塞进缓存，不夹带权限判定。
+        assert peer_client.get("/api/members").status_code == 200
+
+        demoted = owner_client.patch(
+            f"/api/members/{peer.account.user_id}", json={"role": "member"}
+        )
+        assert demoted.status_code == 200, demoted.text
+
+        # 探针必须是走 `_admin`（读缓存身份）的端点。`POST /api/members/invites`
+        # 不用它——那条自己又判了一次库，缓存不缓存都是 403，验不出东西。
+        blocked = peer_client.post(f"/api/members/{seeded.user_id}/disable")
+        assert blocked.status_code == 403, "降职后仍能执行管理员动作——角色没随吊销生效"
+
+
+def test_forget_user_only_drops_that_users_entries() -> None:
+    """`forget_user` 是定点清除：别人那张票不该被顺手清掉。
+
+    两个不同的 user_id 是这条的全部意义——两边都用 `u1` 的版本无论如何都会「通过」，
+    它其实只验了 `get` 返回 None，什么也没证明。
+    """
+    from agentworkbench.core.identity import Owner
+    from agentworkbench.identity.models import AccountStatus, Principal
+
+    cache = SessionCache(60, clock=lambda: 0.0)
+    cache.put("mine", _principal())
+    cache.put(
+        "theirs",
+        Principal(
+            owner=Owner(user_id="u2", tenant_id="t1"),
+            role=Role.ADMIN,
+            status=AccountStatus.ACTIVE,
+            credential_epoch=1,
+        ),
+    )
+
+    cache.forget_user("u1")
+
+    assert cache.get("mine") is None
+    assert cache.get("theirs") is not None, "清自己的票把别人的也清了——那是整表清空"

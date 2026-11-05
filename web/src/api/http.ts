@@ -34,6 +34,7 @@ export class ApiError extends Error {
 }
 
 let unauthorized: (() => void) | null = null
+let passwordChangeRequired: (() => void) | null = null
 
 /**
  * 注册「会话失效」的处理。**由 `main.ts` 装一次**，不是每个调用点各装一次。
@@ -43,6 +44,11 @@ let unauthorized: (() => void) | null = null
  */
 export function onUnauthorized(handler: () => void): void {
   unauthorized = handler
+}
+
+/** 注册「首登必须改密」的处理。与 401 分开：**登录态仍然有效**。 */
+export function onPasswordChangeRequired(handler: () => void): void {
+  passwordChangeRequired = handler
 }
 
 /** 从一段响应文本里取「给人看的那句」。
@@ -83,6 +89,9 @@ export async function handle<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const error = await toApiError(response)
     if (response.status === 401) unauthorized?.()
+    else if (response.status === 403 && error.code === 'password_change_required') {
+      passwordChangeRequired?.()
+    }
     throw error
   }
   // `204 No Content` 与「200 但没 body」走同一条：没有正文就不解析。

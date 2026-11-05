@@ -83,3 +83,5 @@ ADR 与设计文档会写同一件事——这是**有意的**，但必须指定
 | [0005](0005-delete-has-three-layers.md) | 删除分三层承诺，只对 L1 保证原子 | Accepted | F2 |
 | [0006](0006-dedup-by-unique-constraint.md) | 去重靠唯一约束，且迁移必须先审计再删 | Accepted | F2 |
 | [0007](0007-file-before-record.md) | 上传先落盘、后写记录，文件一律覆盖写 | Accepted | F2 |
+| [0008](0008-delete-is-admin-only.md) | 删除文档只对团队管理员开放 | Accepted | F2 |
+| [0009](0009-first-login-password-rotation.md) | 首个管理员首次登录必须改密 | Accepted | F1 |

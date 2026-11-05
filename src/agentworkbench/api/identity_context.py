@@ -42,6 +42,7 @@ from agentworkbench.identity.sessions import SessionCache
 
 __all__ = [
     "COOKIE_NAME",
+    "MUST_CHANGE_ALLOWED",
     "PUBLIC_PATHS",
     "attach_cookie",
     "clear_cookie",
@@ -49,6 +50,7 @@ __all__ = [
     "decision_for",
     "owner_of",
     "principal_of",
+    "require_admin",
     "require_session",
     "ticket_from",
 ]
@@ -75,6 +77,20 @@ PUBLIC_PATHS: Final[frozenset[str]] = frozenset(
 这张表**必须比路由表小得多**。它每多一条，`I-V1` 的覆盖面就少一块，
 而「加进白名单」这个动作在代码里看起来只是个字符串。
 """
+
+MUST_CHANGE_ALLOWED: Final[frozenset[str]] = frozenset(
+    {
+        "/api/auth/me",
+        "/api/auth/logout",
+        "/api/auth/password",
+    }
+)
+"""首登改密期间仍可访问的路径（`I-V19`）。
+
+`me` 让前端知道“为什么被拦”；`logout` 让被强制改密的人至少能换个人登录；
+`password` 是唯一的出口。业务接口一条都不在这里——这张表每多一条，
+首登闸门的覆盖面就少一块。"""
+
 
 _FRAMEWORK_PATHS: Final[frozenset[str]] = frozenset(
     {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
@@ -147,6 +163,15 @@ def require_session(request: Request) -> None:
     with closing(deps.open_conn()) as conn:
         principal = _judge(conn, request, cache=deps.session_cache)
     setattr(request.state, _STATE_PRINCIPAL, principal)
+
+    # 首登改密是**业务面的第二道闸**：票据有效、账户可用，但初始口令还没换。
+    # 放在全局依赖里，新增路由同样被挡住；允许清单只有 me / logout / password。
+    if principal.must_change_password and template not in MUST_CHANGE_ALLOWED:
+        raise AppError(
+            ErrorCode.PASSWORD_CHANGE_REQUIRED,
+            "首次登录后必须先修改初始口令。",
+            reason=str(ReasonCode.PASSWORD_CHANGE_REQUIRED),
+        )
 
 
 def _template_of(request: Request) -> str:
@@ -248,6 +273,21 @@ def principal_of(decision: policy.Decision) -> Principal:
         return decision.principal
     code, message = _REJECTION[decision.outcome]
     raise AppError(code, message, reason=None if decision.reason is None else str(decision.reason))
+
+
+def require_admin(request: Request) -> Principal:
+    """动作级判定：当前身份是不是团队管理员。**必须在查目标之前调用。**
+
+    存在的理由与 `members._admin` 相同——顺序就是判据：先判「你有没有资格调
+    这个动作」（403，不需要目标），再查目标（404）。反过来写，非管理员拿一串
+    id 打这个接口，404 与 403 的差别就成了「这个 id 在不在」的探针。
+
+    与管理接口共用这一份实现：路由各写一份的话，将来改角色模型（加第三种
+    角色、或把某个动作从管理员放开）时漏改的那一处不会报错，只会放行。
+    D9 的 U-19（成员能删管理员上传的文档）就是这样长出来的——需求写「管理员」，
+    实现只判团队，两处都有「谁来决定」的权力。
+    """
+    return principal_of(policy.judge_admin(actor=current_principal(request)))
 
 
 def owner_of(conn: sqlite3.Connection, request: Request) -> Owner:

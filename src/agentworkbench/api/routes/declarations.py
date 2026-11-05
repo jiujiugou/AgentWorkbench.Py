@@ -74,6 +74,27 @@ NOT_PRODUCING: dict[tuple[str, str], str] = {
     ): "读 embedding 一组的配置与 stale 位：只读 system_state 两行，不触发检索或重建",
     ("PUT", "/api/settings/embedding"): "改 embedding 模型：写 system_state 并置索引待重建，"
     "重建本身不在这里发生（那是 F2 的重活），所以不产 run",
+    # ── 设置页的补口（D7 发现前端调了但后端没有的那几条） ──
+    ("GET", "/api/settings"): "设置页的当前配置快照：一次 join 读 providers + provider_models，"
+    "密文与明文都不出去，不触发检索或生成",
+    ("PUT", "/api/settings/providers/{provider_id}"): "改供应商：改名/地址/凭据，落一行 UPDATE",
+    ("DELETE", "/api/settings/providers/{provider_id}"): "删供应商：配置行删除，模型随外键级联；"
+    "历史里的引用快照是留档数据，不因此消失",
+    ("DELETE", "/api/settings/models/{model_id}"): "删模型行：一次 DELETE，不触发执行",
+    (
+        "PUT",
+        "/api/settings/providers/{provider_id}/models/{model_id}/default",
+    ): "设默认模型：清该供应商的默认位再置一行，两个 UPDATE",
+    (
+        "POST",
+        "/api/settings/providers/{provider_id}/test",
+    ): "测连通性：拿库里的钥匙打上游 /models，产物是测试结果而不是一次作答；"
+    "失败也返回 200（那是结果，不是错误）",
+    (
+        "POST",
+        "/api/settings/providers/{provider_id}/fetch-models",
+    ): "拉上游模型清单：一次 GET /models，不落库",
+    ("POST", "/api/settings/fetch-models"): "未保存供应商前的试拉：同样一次 GET /models，不落库",
     ("POST", "/api/auth/login"): "登录：校验口令并签发票据。唯一先于身份的写入口，"
     "没有作答、没有模型调用",
     ("POST", "/api/auth/logout"): "登出：把票据行标记吊销并清 cookie，一次 UPDATE",

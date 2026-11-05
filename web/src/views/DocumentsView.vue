@@ -25,6 +25,7 @@ import {
   reparseDocument,
   uploadDocument,
 } from '@/api/documents'
+import { cachedUser } from '@/api/auth'
 
 /* ---------------- 状态 ---------------- */
 
@@ -34,6 +35,10 @@ const keyword = ref('')
 const viewMode = ref<'grid' | 'list'>('list')
 const statusFilter = ref<string>('')
 const typeFilter = ref<string>('')
+
+// 删除是管理员的动作（ADR 0008）。这里只决定「看不看得见按钮」——
+// 后端仍然会判一次，因为前端拿到的 role 可能是几分钟前的缓存。
+const isAdmin = ref(false)
 
 const uploads = ref<{ key: number; name: string; percent: number; abort: () => void; error: string }[]>([])
 let uploadKey = 0
@@ -123,7 +128,12 @@ function schedulePoll(): void {
   if (busy) pollTimer = window.setTimeout(() => void refresh(true), 3000)
 }
 
-onMounted(() => void refresh())
+onMounted(() => {
+  void refresh()
+  void cachedUser().then((user) => {
+    isAdmin.value = user?.role === 'admin'
+  })
+})
 onBeforeUnmount(() => {
   if (pollTimer !== null) window.clearTimeout(pollTimer)
 })
@@ -149,7 +159,7 @@ async function startUploads(files: File[]): Promise<void> {
   for (const file of files) {
     const ext = extOf(file.name)
     if (!ACCEPT_EXTS.includes(ext)) {
-      ElMessage.warning(`「${file.name}」不支持，仅支持 PDF / TXT / MD / JSON`)
+      ElMessage.warning(`「${file.name}」不支持，仅支持 PDF / Word（.docx）/ Excel（.xlsx）`)
       continue
     }
     if (file.size > MAX_FILE_BYTES) {
@@ -338,14 +348,14 @@ const typeOptions = computed(() => {
             <button class="row-icon" title="重新解析" @click="onReparse(d)">
               <el-icon><RefreshRight /></el-icon>
             </button>
-            <button class="row-icon danger" title="删除" @click="onDelete(d)">
+            <button v-if="isAdmin" class="row-icon danger" title="删除" @click="onDelete(d)">
               <el-icon><Delete /></el-icon>
             </button>
           </span>
         </div>
         <div v-if="filtered.length === 0" class="empty">
           <el-icon><FileIcon /></el-icon>
-          <p>{{ docs.length === 0 ? '还没有资料，从右侧传一份 PDF 开始' : '没有符合筛选条件的资料' }}</p>
+          <p>{{ docs.length === 0 ? '还没有资料，从右侧传一份文件开始' : '没有符合筛选条件的资料' }}</p>
         </div>
       </div>
 
@@ -368,13 +378,18 @@ const typeOptions = computed(() => {
             >{{ statusText(d) }}<i v-if="d.status === 'parsing'" class="dot"
           /></span>
           <span class="gmeta">{{ fmtSize(d.sizeBytes) }} · {{ fmtTime(d.createdAt) }}</span>
-          <button class="row-icon danger gdel" title="删除" @click.stop="onDelete(d)">
+          <button
+            v-if="isAdmin"
+            class="row-icon danger gdel"
+            title="删除"
+            @click.stop="onDelete(d)"
+          >
             <el-icon><Delete /></el-icon>
           </button>
         </div>
         <div v-if="filtered.length === 0" class="empty">
           <el-icon><FileIcon /></el-icon>
-          <p>{{ docs.length === 0 ? '还没有资料，从右侧传一份 PDF 开始' : '没有符合筛选条件的资料' }}</p>
+          <p>{{ docs.length === 0 ? '还没有资料，从右侧传一份文件开始' : '没有符合筛选条件的资料' }}</p>
         </div>
       </div>
     </section>
@@ -393,7 +408,7 @@ const typeOptions = computed(() => {
         <el-icon class="dz-icon"><UploadFilled /></el-icon>
         <p class="dz-text">拖拽文件到这里，或点击选择</p>
         <button class="btn-dark" @click.stop="pickFiles">上传文件</button>
-        <p class="dz-hint">支持 PDF / TXT / MD / JSON，单个 ≤ 30 MB</p>
+        <p class="dz-hint">支持 PDF / Word（.docx）/ Excel（.xlsx），单个 ≤ 30 MB</p>
       </div>
 
       <input ref="fileInput" type="file" multiple :accept="ACCEPT_EXTS.join(',')" hidden @change="onFilesChosen" />
@@ -452,7 +467,7 @@ const typeOptions = computed(() => {
           <button class="btn-ghost" @click="onReparse(current)">
             <el-icon><RefreshRight /></el-icon> 重新解析
           </button>
-          <button class="btn-ghost danger" @click="onDelete(current)">
+          <button v-if="isAdmin" class="btn-ghost danger" @click="onDelete(current)">
             <el-icon><Delete /></el-icon> 删除
           </button>
         </div>

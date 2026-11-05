@@ -85,13 +85,24 @@ def open_conn(app: FastAPI) -> sqlite3.Connection:
     return cast(Deps, app.state.deps).open_conn()
 
 
-def seed_admin(app: FastAPI, *, email: str = ADMIN_EMAIL) -> service.BootstrapResult:
+def seed_admin(
+    app: FastAPI, *, email: str = ADMIN_EMAIL, must_change_password: bool = False
+) -> service.BootstrapResult:
     """空库引导。走服务层而不是 HTTP：引导**没有**端点，它是部署时的一条命令
-    （`scripts/bootstrap_identity.py`），暴露成 HTTP 就等于把永久后门挂在网上。"""
+    （`scripts/bootstrap_identity.py`），暴露成 HTTP 就等于把永久后门挂在网上。
+
+    默认 `must_change_password=False`：大多数用例测的是登录/改密/成员管理本身，
+    不是首登闸门；需要那条链的用例显式传 True。
+    """
     conn = open_conn(app)
     try:
         return service.bootstrap(
-            conn, email=email, password=PASSWORD, tenant_name="团队甲", now=NOW
+            conn,
+            email=email,
+            password=PASSWORD,
+            tenant_name="团队甲",
+            now=NOW,
+            must_change_password=must_change_password,
         )
     finally:
         conn.close()
@@ -150,9 +161,10 @@ def test_login_sets_an_httponly_lax_cookie_and_keeps_the_token_out_of_the_body(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"id", "email", "role", "status", "tenantId"}
+    assert set(body) == {"id", "email", "role", "status", "tenantId", "mustChangePassword"}
     assert body["email"] == ADMIN_EMAIL
     assert body["role"] == "admin"
+    assert body["mustChangePassword"] is False
 
     cookie = response.headers["set-cookie"].lower().replace(" ", "")
     assert cookie.startswith("awb_session=")
@@ -235,8 +247,73 @@ def test_me_round_trips_the_account(client: TestClient, app: FastAPI) -> None:
 
     body = client.get("/api/auth/me").json()
 
-    assert set(body) == {"id", "email", "role", "status", "tenantId"}
+    assert set(body) == {"id", "email", "role", "status", "tenantId", "mustChangePassword"}
     assert body["status"] == "active"
+    assert body["mustChangePassword"] is False
+
+
+# ── 首登改密（I-V19） ──
+
+
+def test_login_reports_must_change_password(app: FastAPI, client: TestClient) -> None:
+    """登录成功也要把“还没改初始口令”带回来；否则前端不知道该进哪一页。"""
+    seed_admin(app, must_change_password=True)
+
+    response = login(client)
+
+    assert response.status_code == 200
+    assert response.json()["mustChangePassword"] is True
+
+
+def test_first_login_is_limited_to_me_logout_and_change_password(
+    app: FastAPI, client: TestClient
+) -> None:
+    """改密前业务接口 403；me / logout / 改密本身仍然可达。
+
+    只拦业务接口、不拦 logout：否则一个被强制改密的用户连“换个人登录”都做不到。
+    只拦业务接口、不拦 me：否则前端拿不到“为什么被拦”，只能显示一个空白页。
+    """
+    seed_admin(app, must_change_password=True)
+    assert login(client).status_code == 200
+
+    blocked = client.get("/api/documents")
+    assert blocked.status_code == 403
+    assert blocked.json()["code"] == "password_change_required"
+
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["mustChangePassword"] is True
+
+    # 登出在另一个客户端上验，主客户端还要留着 cookie 去改密。
+    other = another_client(app)
+    assert login(other).status_code == 200
+    assert other.post("/api/auth/logout").status_code == 204
+
+    assert (
+        client.post(
+            "/api/auth/password",
+            json={"oldPassword": PASSWORD, "newPassword": NEW_PASSWORD},
+        ).status_code
+        == 204
+    )
+
+
+def test_changing_the_initial_password_unlocks_the_api(app: FastAPI, client: TestClient) -> None:
+    """改密成功后同一张 cookie 立即可用，标记必须清 0。"""
+    seed_admin(app, must_change_password=True)
+    assert login(client).status_code == 200
+    assert client.get("/api/documents").status_code == 403
+
+    changed = client.post(
+        "/api/auth/password",
+        json={"oldPassword": PASSWORD, "newPassword": NEW_PASSWORD},
+    )
+    assert changed.status_code == 204
+
+    assert client.get("/api/documents").status_code == 200
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["mustChangePassword"] is False
 
 
 # ── 登出（I-V14） ──
@@ -588,3 +665,88 @@ def test_endpoints_that_must_stay_absent_are_absent(
     response = client.request(method, path, json={})
 
     assert response.status_code == 404
+
+
+# ── D9 红队抓到的两条：空口令 / 邀请被当邮箱枚举器 ──
+
+
+def test_an_empty_password_cannot_create_an_account(app: FastAPI, client: TestClient) -> None:
+    """接受邀请时口令不能是空串——否则建出一个「知道邮箱就能登录」的账号。
+
+    D9 红队 A 的 R-02：`POST /api/auth/invites/<t> {"password": ""}` 返回 201，
+    随后 `POST /api/auth/login {"password": ""}` 返回 200。这种账号在成员列表里
+    与正常账号长得一模一样，入侵者可以先把自己降成空口令再躲在里面。
+
+    同时断言**这张邀请没有被烧掉**：口令格式错误是客户端的问题，不该让被邀请人
+    回去找管理员重发一张。
+    """
+    seed_admin(app)
+    assert login(client).status_code == 200
+    token = client.post("/api/members/invites", json={"role": "member"}).json()["token"]
+
+    anonymous = TestClient(app, raise_server_exceptions=False)
+    rejected = anonymous.post(
+        f"/api/auth/invites/{token}", json={"email": "new@example.com", "password": "   "}
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.json()["code"] == "validation_failed"
+
+    # 换一个正常口令，同一张邀请仍然可用
+    accepted = anonymous.post(
+        f"/api/auth/invites/{token}",
+        json={"email": "new@example.com", "password": "a-real-passphrase"},
+    )
+    assert accepted.status_code == 201, "口令格式错误把邀请也烧掉了——那会逼用户找人重发"
+
+
+def test_changing_the_password_to_empty_is_rejected(app: FastAPI, client: TestClient) -> None:
+    """改密同样不许把口令改成空串，且失败后旧口令仍然有效。"""
+    seed_admin(app)
+    assert login(client).status_code == 200
+
+    rejected = client.post("/api/auth/password", json={"oldPassword": PASSWORD, "newPassword": ""})
+    assert rejected.status_code == 400, rejected.text
+
+    # 旧口令没被改动：换一个新客户端重新登录仍然可以
+    fresh = TestClient(app, raise_server_exceptions=False)
+    assert login(fresh).status_code == 200
+
+
+def test_probing_a_registered_email_burns_the_invite(app: FastAPI, client: TestClient) -> None:
+    """一张邀请只能换到一次「这个邮箱注册过吗」的答案。
+
+    D9 红队 A/B 各自复现过：`400 这个邮箱已经有账号了` 这条失败路径**不消耗令牌**，
+    于是一张邀请可以拿一份邮箱名单逐个跑一遍——而邀请会被转发、会留在聊天记录里。
+
+    现在的语义：问一次，令牌作废（`accepted_at` 有值、`accepted_by` 为空）。
+    这一步不能消掉「这一次的答案」，但把它从「无限次」变成「一次」。
+    """
+    seeded = seed_admin(app)
+    assert login(client).status_code == 200
+    invite = client.post("/api/members/invites", json={"role": "member"}).json()
+    token, invite_id = invite["token"], invite["inviteId"]
+
+    anonymous = TestClient(app, raise_server_exceptions=False)
+    probe = anonymous.post(
+        f"/api/auth/invites/{token}", json={"email": ADMIN_EMAIL, "password": PASSWORD}
+    )
+    assert probe.status_code == 400, probe.text
+    assert "已经有账号" in probe.json()["message"]
+
+    # 同一张邀请再试一次（哪怕换一个全新邮箱）→ 已经没用了
+    again = anonymous.post(
+        f"/api/auth/invites/{token}",
+        json={"email": "brand-new@example.com", "password": PASSWORD},
+    )
+    assert again.status_code == 404, "这张邀请还在被复用——枚举器仍然成立"
+
+    conn = open_conn(app)
+    try:
+        row = conn.execute(
+            "select accepted_at, accepted_by from invites where id = ?", (invite_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["accepted_at"] is not None, "邀请没有被标记作废"
+    assert row["accepted_by"] is None, "没人接受过它，记成某人接受会让审计回答错问题"
+    assert seeded.user_id  # 只是让 seed 的返回值被用到，别被 lint 当成未使用

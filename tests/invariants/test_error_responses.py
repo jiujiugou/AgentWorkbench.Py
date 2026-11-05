@@ -251,3 +251,90 @@ def test_internal_address_sentinel_reaches_logs_not_response(
 
     assert sentinel not in response.text, "内网地址泄露进了响应体"
     assert sentinel in caplog.text
+
+
+# ── D6 补：校验失败的形态，与「按 request_id 查得到」 ──
+
+
+def test_validation_failures_use_the_same_envelope(h: Harness) -> None:
+    """S-V4：**校验失败也是五字段信封**，不是框架默认的 `{"detail": [...]}`。
+
+    前端只认 `message`；默认体没有这个字段时，用户看到的是整段 JSON 原文。
+    这条与 404/500 分开验，因为它是**第三个** handler——前两个写对了，
+    第三个仍然可以是默认实现（D6 之前就是）。
+    """
+    response = h.client.post("/api/knowledge/ask", json={"question": ""})
+    assert response.status_code == 400, response.text
+    body = response.json()
+    for field in ("code", "http_status", "message", "retryable", "request_id"):
+        assert field in body, f"校验失败的错误体缺 {field}"
+    assert body["code"] == "validation_failed"
+    assert body["http_status"] == 400 == response.status_code
+    assert body["retryable"] is False
+    assert response.headers["x-request-id"] == body["request_id"]
+
+
+def test_validation_failures_do_not_echo_the_rejected_value(h: Harness) -> None:
+    """S-V5：被拒的**值**不回显——只回「哪个字段、什么毛病」。
+
+    这是 D6 实测抓到的泄露：pydantic 每条错误都带 `input`（客户端提交的原值）。
+    类型写错的 apiKey 会被原样放进响应体，于是密钥进了浏览器 devtools、
+    反代访问日志、前端错误上报。
+    """
+    sentinel = "sk-d6-echo-sentinel"
+    response = h.client.post("/api/knowledge/ask", json={"question": {"nested": sentinel}})
+
+    assert response.status_code == 400, response.text
+    assert sentinel not in response.text, "被拒的值被回显了"
+    assert "question" in response.json()["message"], "至少要告诉用户是哪个字段写错了"
+
+
+def test_every_failure_is_findable_by_request_id_in_the_logs(
+    h: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """S-H2：失败请求必须按 request_id 在日志里查得到（不只是「500 有栈」）。
+
+    改坏前的形态：只有兜底 500 写日志，503 / 404 一条不留——客户端贴来
+    `X-Request-Id`，运维在日志里搜不到任何东西。响应里带一个查不到的编号，
+    等于这个能力不存在。
+    """
+    with caplog.at_level(logging.INFO):
+        response = h.client.get("/api/conversations/never-existed/messages")
+
+    request_id = response.headers["x-request-id"]
+    ours = [record for record in caplog.records if record.name.startswith("agentworkbench")]
+    matching = [record for record in ours if request_id in record.getMessage()]
+    assert matching, f"按 request_id={request_id} 在日志里查不到"
+    joined = "\n".join(record.getMessage() for record in matching)
+    assert "not_found" in joined, "日志里没有错误码"
+    assert "/api/conversations/" in joined, "日志里没有路径"
+
+
+def test_an_unknown_path_uses_the_same_envelope(h: Harness) -> None:
+    """未匹配的路径也是五字段信封 + `X-Request-Id`。
+
+    改坏这里会怎样：删掉 `on_http_error`，Starlette 的默认实现回来，响应变成
+    `{"detail": "Not Found"}`——前端 `parseError` 只认 `message`，于是用户看到的是
+    这段 JSON 原文；而且这种失败**没法按 request_id 去日志里定位**，
+    因为那个头也不存在了（D9 红队 C 的 R-05）。
+    """
+    response = h.client.get("/api/nope")
+
+    assert response.status_code == 404, response.text
+    body = response.json()
+    for field in ("code", "http_status", "message", "retryable", "request_id"):
+        assert field in body, f"未匹配路径的错误体缺 {field}：{body}"
+    assert body["code"] == "not_found"
+    assert response.headers["x-request-id"] == body["request_id"]
+
+
+def test_a_wrong_method_looks_exactly_like_a_missing_path(h: Harness) -> None:
+    """方法不对也归 404：这个产品不确认「某个路径存在」。
+
+    405 会告诉未登录的人「这个路径是真的」，而那是**不需要任何权限**就能做的探测。
+    `/api/documents/{别人的 id}` 与不存在的 id 都是 404，是同一条取向。
+    """
+    response = h.client.put("/api/health")
+
+    assert response.status_code == 404, response.text
+    assert response.json()["code"] == "not_found"

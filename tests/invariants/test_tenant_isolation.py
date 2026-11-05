@@ -169,6 +169,7 @@ def two_teams(app: FastAPI) -> Iterator[tuple[str, str, str, str]]:
             password=PASSWORD,
             tenant_name="团队甲",
             now=datetime.now(UTC),
+            must_change_password=False,
         )
     finally:
         conn.close()
@@ -265,6 +266,32 @@ def test_search_still_finds_my_own_document(
 
     assert hits, "本团队的文档必须搜得到"
     assert all(hit["documentId"] == "doc-a" for hit in hits)
+
+
+def test_single_character_fallback_is_scoped_to_my_team(
+    app: FastAPI, two_teams: tuple[str, str, str, str]
+) -> None:
+    """单字查询走 LIKE 兜底路，那条路的团队条件必须和主路一样硬。
+
+    **D4 变异测试发现的缺口**（2026-11-04）：`_match_rows` 与 `_like_rows`
+    各有一份团队子查询，原来的隔离测试只用了多字词（走 MATCH 主路），
+    把 `_like_rows` 的条件删掉时全部测试仍然绿。
+
+    用户能看到的后果：搜一个「竞」字，响应里就出现竞争对手文档的片段——
+    而中文单字查询是正常用法（`泵`、`站`、`阀`），不是构造出来的攻击输入。
+    """
+    alice = new_client(app)
+    login(alice, ALICE)
+
+    hits = alice.get("/api/knowledge/search", params={"q": "竞"}).json()
+
+    assert hits == [], "单字兜底路漏了团队条件：别的团队的片段进了响应"
+    assert TEAM_B_SECRET not in str(hits)
+
+    # 正控：过滤没有把本团队的单字查询一起挡掉
+    own = alice.get("/api/knowledge/search", params={"q": "液"}).json()
+    assert own, "本团队的文档必须搜得到（LIKE 路也是）"
+    assert all(hit["documentId"] == "doc-a" for hit in own)
 
 
 def test_hybrid_retrieval_never_surfaces_another_teams_chunks(

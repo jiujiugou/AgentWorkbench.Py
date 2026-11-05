@@ -25,6 +25,9 @@ ALLOWED_GLOBAL_IGNORES = {"RUF001", "RUF002", "RUF003"}  # 中文全角标点不
 ALLOWED_PER_FILE_IGNORES = {
     "tests/*": {"S101"},
     "scripts/*": {"S603", "S607", "T20"},
+    # 红队发现的可复跑脚本：`assert` 在这里是「环境不对就别往下跑」的前置检查，
+    # 不是可以被攻击者绕过的安全断言——它不是产品代码，不进服务器进程。
+    "scripts/repro/*": {"S101"},
     "evals/*": {"T20", "S603"},
     # vendored 副本（与 self 原版只差题库路径）：豁免随原件，S608 是原件里的 LIKE 拼接
     "evals/run_rag_eval_v2.py": {"T20", "S608"},
@@ -285,7 +288,9 @@ REQUIRED_VERIFICATION_IDS = (
     # F2：知识资料。V-13~V-18 是 Office 格式（2026-11-04 补）——
     # 判据先于实现存在（TDD），所以它们此刻是 partial；闸门只检查「登记了
     # 就必须有对应测试」，不检查测试是不是绿的。
-    {f"V-{index}" for index in range(1, 19)}
+    # V-19 是删除的权限边界（2026-11-05，D9-B R-03 → ADR 0008）：不来自原 REQ 表，
+    # 来自一次实测——REQ-10 的 actor 写「管理员」，实现只判团队。
+    {f"V-{index}" for index in range(1, 20)}
     | {f"G{index}" for index in range(1, 16)}  # F3：知识问答（功能验证 §4.2）
     # F4：执行与审计（§4.2）。id 用 `A-` 前缀 + 文档原编号，A-V1b 就是 V1b
     | {f"A-V{n}" for n in ("1", "1b", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11")}
@@ -304,7 +309,8 @@ REQUIRED_VERIFICATION_IDS = (
     # I-V17 是界面那一侧（格 7 补）：本域只要求界面做三件事，多一件都属于 F5。
     # I-V18 是平台级配置的写权限（2026-11-04 补）：这一条不来自任何表格，
     # 来自一次实测——`settings` 六条端点当时只要求登录，而 `providers` 是全局表。
-    | {f"I-V{n}" for n in range(1, 19)}
+    # I-V19（2026-11-05）是首个管理员的首登改密：引导口令不能长期有效。
+    | {f"I-V{n}" for n in range(1, 20)}
     | {f"I-H{n}" for n in range(1, 6)}  # F1 人工项（空库部署 / 文案 / 运维能答 / 界面 / 隔离）
 )
 VERIFICATION_STATUSES = {"pass", "partial", "fail", "manual"}

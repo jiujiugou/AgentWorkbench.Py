@@ -15,7 +15,7 @@
 import type { Router } from 'vue-router'
 
 import { forgetSession } from './api/auth'
-import { onUnauthorized } from './api/http'
+import { onPasswordChangeRequired, onUnauthorized } from './api/http'
 
 export function installSessionExpiry(router: Router): void {
   onUnauthorized(() => {
@@ -25,5 +25,15 @@ export function installSessionExpiry(router: Router): void {
     // 用户按「后退」会看到自己刚离开的那一页闪一下又被弹回来。
     if (current.name === 'login') return
     void router.push({ path: '/login', query: { redirect: current.fullPath } })
+  })
+
+  onPasswordChangeRequired(() => {
+    // 首登改密不是会话失效：**不清登录态**，否则改密页自己也会 401。
+    const current = router.currentRoute.value
+    if (current.name === 'change-password') return
+    void router.push({
+      path: '/change-password',
+      query: { redirect: current.fullPath },
+    })
   })
 }

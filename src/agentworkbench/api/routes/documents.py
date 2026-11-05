@@ -22,7 +22,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
-from typing import Annotated, cast
+from typing import Annotated, BinaryIO, Final, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Request, Response, UploadFile
@@ -30,13 +30,14 @@ from fastapi.responses import JSONResponse
 
 from agentworkbench.api.deps import Deps, utc_now
 from agentworkbench.api.errors import UploadRejected, not_found, validation_failed
-from agentworkbench.api.identity_context import owner_of
+from agentworkbench.api.identity_context import owner_of, require_admin
 from agentworkbench.api.schemas import ChunkDto, DocumentDto, ErrorDto, PageDto
 from agentworkbench.core.documents import DocStatus
 from agentworkbench.db.repositories import documents as repo
 from agentworkbench.ingest import pipeline, worker
 from agentworkbench.ingest.delete_ports import SqliteDeletePorts
 from agentworkbench.ingest.deletion import DeleteOutcome, delete_document
+from agentworkbench.ingest.upload import UploadRejectCode
 
 router = APIRouter(prefix="/api/documents")
 
@@ -73,6 +74,40 @@ def _drain_runner(deps: Deps) -> Callable[[], None]:
     return run
 
 
+_READ_CHUNK: Final[int] = 1 << 20
+"""读上传流的块大小（1 MiB）。"""
+
+_MULTIPART_SLACK: Final[int] = 64 * 1024
+"""multipart 信封的余量：分界符、每个 part 的头、文件名。
+
+只用于 `Content-Length` 那一步**提前**拒绝——真正的上限判定在
+`upload.judge_upload`，这里只是别为了一份明显超标的请求先把几百 MB 读进内存。
+余量给 64KB 是因为它远大于正常的头（几百字节），又远小于一个误判的代价。
+"""
+
+
+def _read_with_limit(stream: BinaryIO, limit: int) -> bytes:
+    """边读边数，超过上限立刻抛 `UploadRejected(FILE_TOO_LARGE)`。
+
+    **为什么不能先 `read()` 再判大小**：D9 红队实测，100MB 的请求体让服务端
+    RSS 从 21MB 涨到 128MB 才回 400 `FILE_TOO_LARGE`——"被拒之前先把内存占了"。
+    Starlette 只对超过 1MB 的 part 转存临时文件，`UploadFile.file.read()`
+    又会整份读回内存，于是 `max_upload_bytes` 这个防护的作用点在**最不该**
+    的位置。改成有上限的循环读取之后，内存峰值是 `limit + 1 块`。
+
+    上限本身仍由 `judge_upload` 判：这里只保证「不会读超过上限太多」，
+    不负责说「太大了」以外的任何语义。
+    """
+    buffer = bytearray()
+    while True:
+        chunk = stream.read(_READ_CHUNK)
+        if not chunk:
+            return bytes(buffer)
+        buffer.extend(chunk)
+        if len(buffer) > limit:
+            raise UploadRejected(UploadRejectCode.FILE_TOO_LARGE)
+
+
 @router.post("", status_code=202)
 def upload(
     request: Request,
@@ -82,7 +117,18 @@ def upload(
     """收一份文件。返回时只承诺 pending——**同步解析完再返回是错的**：
     那会让断连容忍、状态可见、失败分类全废。"""
     deps = _deps(request)
-    data = file.file.read() if file is not None else b""
+    limit = deps.settings.max_upload_bytes
+    # 先看声明的长度：明显超标就不往内存里读。
+    #
+    # 注意它**拦不住磁盘**：FastAPI 在调用本函数之前就把 multipart 落成了
+    # SpooledTemporaryFile（>1MB 转存磁盘），所以这里能省的只是"把几百 MB
+    # 读回内存"这一步。真正的内存护栏是 `_read_with_limit`（有上限的循环读），
+    # 而"别让一个超大请求体把磁盘写满"要靠网关或反代的 body 限制——
+    # 记在 `docs/验收/未解决问题.md` U-17。
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit + _MULTIPART_SLACK:
+        raise UploadRejected(UploadRejectCode.FILE_TOO_LARGE)
+    data = _read_with_limit(file.file, limit) if file is not None else b""
     filename = file.filename if file is not None else None
     with closing(deps.open_conn()) as conn:
         # 归属来自登录身份，不再是 `settings.tenant_id` 这个单租户常量。
@@ -98,7 +144,7 @@ def upload(
             data=data,
             now=utc_now(),
             doc_id=f"doc-{uuid4().hex[:12]}",
-            max_bytes=deps.settings.max_upload_bytes,
+            max_bytes=limit,
             allowed_suffixes=deps.settings.suffix_set,
         )
         if result.reject is not None:
@@ -197,8 +243,15 @@ def remove(request: Request, doc_id: str) -> Response:
     """删除补偿的四步编排见 `ingest/deletion.py`；这里只翻译结果码。
 
     RETRY_LATER 返回 202：删除没完成，记录还在（delete_pending），
-    客户端可以原样重试——这是幂等入口，不是错误。"""
+    客户端可以原样重试——这是幂等入口，不是错误。
+
+    **只有团队管理员能删**（ADR 0008，REQ-10 的 actor 表）。判定放在查行之前：
+    「你有没有资格调这个动作」与「这个 id 在不在」是两个问题，顺序反了，
+    成员就能拿一串 id 试出文档是否存在（403 与 404 的差别）。
+    成员删别人的 id 与随机 id 都得到同一个 403——这个响应不携带任何资源信息。
+    """
     deps = _deps(request)
+    require_admin(request)
     with closing(deps.open_conn()) as conn:
         # 判定先于删除编排：`delete_document` 按 id 删五处表，它不认识团队。
         # 前面这道读是「这一行归不归我」，由它决定要不要进编排——

@@ -23,7 +23,8 @@ export interface SettingsPreview {
   baseUrl: string
   model: string
   embeddingModel: string
-  temperature: number
+  // Python 版没有 temperature 这个旋钮：后端恒返回 null，界面显示「不适用」
+  temperature: number | null
   systemPrompt: string
   apiKeyConfigured: boolean
   configured: boolean
@@ -49,7 +50,14 @@ const jsonHeaders = { 'Content-Type': 'application/json' }
 export const settingsApi = {
   preview: () => fetch('/api/settings').then((r) => handle<SettingsPreview>(r)),
 
-  listProviders: () => fetch('/api/settings/providers').then((r) => handle<Provider[]>(r)),
+  // 后端返回的是 `{providers: [...]}`（白名单 DTO 包了一层）。曾经这里按裸数组解析：
+  // `providers.value` 变成一个对象，`flatMap` 当场抛错被 catch 成空列表——
+  // 表现是配好的模型在界面上永远显示「未配置模型 · 去设置」，设置页也列不出供应商。
+  // （D7 UI 验收抓到的，见 reports/acceptance/2026-11-05/d7-ui.md）
+  listProviders: () =>
+    fetch('/api/settings/providers')
+      .then((r) => handle<{ providers: Provider[] }>(r))
+      .then((body) => body.providers ?? []),
 
   createProvider: (input: ProviderInput) =>
     fetch('/api/settings/providers', {

@@ -19,19 +19,35 @@ export interface AuthUser {
   role: string
   status: string
   tenantId: string
+  /** 首次登录还没改初始口令：业务接口会 403，界面应直接进改密页。 */
+  mustChangePassword: boolean
 }
 
 // 登录态缓存：null = 还没查过。登录/登出必须同步改它，否则路由守卫会用旧结果。
 let signedIn: boolean | null = null
-let pending: Promise<boolean> | null = null
+let me: AuthUser | null = null
+let pending: Promise<AuthUser | null> | null = null
 
-export function cachedSignedIn(): Promise<boolean> {
-  if (signedIn !== null) return Promise.resolve(signedIn)
+/**
+ * 当前登录用户。**界面用它决定「显示哪些按钮」，后端用它决定「放不放行」——
+ * 两边都要有，缺一边就是 U-19 那种形态：按钮在，接口也认。**
+ *
+ * 缓存的是整份用户而不是一个布尔：`/me` 本来就回 `role`，再发一次请求只为读
+ * 一个字段，会在每次进页面时多打一次后端，而结果只用来藏一个按钮。
+ */
+export function cachedUser(): Promise<AuthUser | null> {
+  if (signedIn === false) return Promise.resolve(null)
+  if (signedIn === true) return Promise.resolve(me)
   pending ??= fetchMe().then((user) => {
+    me = user
     signedIn = user !== null
-    return signedIn
+    return user
   })
   return pending
+}
+
+export function cachedSignedIn(): Promise<boolean> {
+  return cachedUser().then((user) => user !== null)
 }
 
 /**
@@ -44,6 +60,7 @@ export function cachedSignedIn(): Promise<boolean> {
  */
 export function forgetSession(): void {
   signedIn = null
+  me = null
   pending = null
 }
 
@@ -77,6 +94,7 @@ export async function login(email: string, password: string): Promise<AuthUser> 
   }
   const user = await handle<AuthUser>(response)
   signedIn = true
+  me = user
   pending = null
   return user
 }
@@ -86,5 +104,23 @@ export async function logout(): Promise<void> {
   // 先算注销再改本地状态：网络失败时票还在，界面却显示未登录的话，
   // 下一个请求带着有效的票、界面却让人再登一次。
   signedIn = false
+  me = null
   pending = null
+}
+
+/**
+ * 本人改密。**不走 `handle`**：旧口令错的响应也是 401，而 `handle` 会把它
+ * 当成“会话过期”清登录态、跳登录页——用户只是输错了旧口令，却被踢出去。
+ *
+ * 成功后同步清掉本地标记：改密页随后会调 `restore()`，路由守卫不能还用旧值
+ * 把人弹回改密页。
+ */
+export async function changePassword(oldPassword: string, newPassword: string): Promise<void> {
+  const response = await fetch('/api/auth/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ oldPassword, newPassword }),
+  })
+  if (!response.ok) throw await toApiError(response)
+  if (me) me = { ...me, mustChangePassword: false }
 }

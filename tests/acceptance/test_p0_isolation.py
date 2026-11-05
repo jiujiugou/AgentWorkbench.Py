@@ -48,6 +48,18 @@ GLOBAL_PATH_PARAM = {
     ("POST", "/api/settings/providers/{provider_id}/models"): (
         "平台级资源：provider_models 没有 tenant 列"
     ),
+    ("PUT", "/api/settings/providers/{provider_id}"): "平台级资源：providers 没有 tenant 列",
+    ("DELETE", "/api/settings/providers/{provider_id}"): "平台级资源：providers 没有 tenant 列",
+    ("DELETE", "/api/settings/models/{model_id}"): "平台级资源：provider_models 没有 tenant 列",
+    ("PUT", "/api/settings/providers/{provider_id}/models/{model_id}/default"): (
+        "平台级资源：provider_models 没有 tenant 列"
+    ),
+    ("POST", "/api/settings/providers/{provider_id}/test"): (
+        "平台级资源：探测的是这套部署的供应商，不涉及任何团队数据"
+    ),
+    ("POST", "/api/settings/providers/{provider_id}/fetch-models"): (
+        "平台级资源：同上，产物是上游模型清单"
+    ),
     ("POST", "/api/auth/invites/{token}"): "公开入口：邀请令牌本身是全局一次性凭证",
 }
 """有路径参数、但不属于团队边界的路由。**每一条都要写理由。**"""

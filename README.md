@@ -54,8 +54,9 @@ python -m venv .venv
 set AWB_SECRET_KEY=换成一段随机长字符串   # PowerShell 用 $env:AWB_SECRET_KEY=...
 
 # 2) 建管理员（只能成功一次；口令走环境变量或交互输入，不收 --password）
-set AWB_BOOTSTRAP_PASSWORD=你的口令
+set AWB_BOOTSTRAP_PASSWORD=你的口令（至少 12 位）
 .venv\Scripts\python scripts\bootstrap_identity.py
+# 首次登录必须先修改这个初始口令；改完才能使用资料库与对话
 
 # 3) 前端产物（已有 web/dist 可跳过）
 cd web && npm install && npm run build && cd ..
@@ -66,6 +67,22 @@ cd web && npm install && npm run build && cd ..
 ```
 
 建表在启动时自动完成（幂等）；**老库**升级结构用 `.venv\Scripts\alembic upgrade head`。
+
+### 已经部署过的机器：一条命令
+
+```bat
+start.bat
+start.bat --host 0.0.0.0 --port 8080
+```
+
+`start.bat`（双击也行）做三件事，然后把参数原样转给 `serve`：
+
+1. 从 `data\.secret_key` 读密钥（环境变量 `AWB_SECRET_KEY` 优先）；
+2. 检查 `data\agentworkbench.db` 在不在——不在就提示先跑引导，而不是起一个登不进去的服务；
+3. 切到项目根再启动，避免「服务起来了但页面 404」（`serve` 的前端目录是相对 cwd 的）。
+
+逻辑在 `scripts/start.py`，`start.bat` 只是纯 ASCII 的壳（cmd 按系统代码页逐字节解析 `.bat`，
+写 UTF-8 中文注释会把命令行切断）。
 
 ### 备份与恢复
 

@@ -43,7 +43,11 @@ export interface DocumentChunkDto {
   charCount: number
 }
 
-export const ACCEPT_EXTS = ['.pdf', '.txt', '.md', '.json']
+// 必须与后端白名单一致：src/agentworkbench/ingest/upload.py::DEFAULT_ALLOWED_SUFFIXES。
+// 曾经这里写的是 ['.pdf', '.txt', '.md', '.json']——Word 与 Excel 在界面上根本传不上去，
+// 而 TXT/MD/JSON 放过去之后被后端拒（D7 UI 验收抓到的，见 reports/acceptance/2026-11-05/d7-ui.md）。
+// 这条一致性由 tests/invariants/test_upload_codes.py 里那条跨语言契约测试守着。
+export const ACCEPT_EXTS = ['.pdf', '.docx', '.xlsx']
 export const MAX_FILE_BYTES = 30 * 1024 * 1024
 
 export async function listDocuments(): Promise<DocumentDto[]> {

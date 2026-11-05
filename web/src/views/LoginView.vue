@@ -3,9 +3,11 @@ import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { login } from '@/api/auth'
+import { useAgentStore } from '@/stores/agent'
 
 const route = useRoute()
 const router = useRouter()
+const agent = useAgentStore()
 
 const email = ref('')
 const password = ref('')
@@ -19,8 +21,19 @@ async function submit(): Promise<void> {
   busy.value = true
   try {
     const user = await login(email.value.trim(), password.value)
-    ElMessage.success(`你好，${user.email}`)
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
+    if (user.mustChangePassword) {
+      // 先别 restore：业务请求此刻会被 403，徒增一串错误。
+      ElMessage.warning('首次登录请先修改初始口令')
+      void router.push({ path: '/change-password', query: { redirect } })
+      return
+    }
+    // 登录成功后必须**重跑一次初始化**：整个 SPA 只在 App.vue 挂载时初始化一次，
+    // 而那时用户还在登录页（所有请求都是 401）。不补这一句，会话列表与"当前模型"
+    // 会一直空着，界面显示「未配置模型 · 去设置」——明明配好了，用户以为没配。
+    // （D7 UI 验收抓到：登录后进对话页，模型标识一直停在"未配置模型"，刷新才正常。）
+    await agent.restore()
+    ElMessage.success(`你好，${user.email}`)
     void router.push(redirect)
   } catch (e) {
     ElMessage.error((e as Error).message)

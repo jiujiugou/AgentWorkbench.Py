@@ -23,6 +23,7 @@ import importlib.util
 import os
 import sqlite3
 import sys
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +39,32 @@ os.environ.setdefault("AWB_SECRET_KEY", "unit-test-secret-key")
 # 给出不同结果，是最难查的一类不稳定。要验窗口本身的用例（test_global_gate.py）
 # 自己构造 `Settings(auth=...)` 覆盖这一项。
 os.environ.setdefault("AWB_AUTH__SESSION_INVALIDATE_SECONDS", "0")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """给每次运行一个**唯一**的临时根目录，放在 `reports/`（gitignore）下。
+
+    不用 pytest 默认的 `%TEMP%`，有两个都不轻的理由：
+
+    1. **删除守卫会杀掉进程。** pytest 在会话结束时把当次所有临时目录移进
+       `garbage-<uuid>/` 再一次性删除——几百个文件一次删，装过删除守卫的机器会
+       直接拦下并终止进程。表现是：**全部测试都通过**，进程仍以非 0 退出，
+       报告里一条失败也没有（D4、D6 各踩一次，各花半小时才定位）。
+    2. `%TEMP%` 在系统盘。一次全量跑产生约 600MB，攒几次就把 C 盘吃满，
+       而 C 盘满了的表现是 `OperationalError: database or disk is full`——
+       看起来像数据库坏了。
+
+    显式给 `basetemp` 之后 pytest 不再做那套「收集 + 批量删除」，只会在启动时
+    清空给定目录；每次运行一个 `run-<纳秒>`，等于谁也不清。代价是 `reports/`
+    下会留一堆临时目录，它们本来就是可丢弃的（同 `reports/acceptance/` 的定位）。
+    """
+    if not config.option.basetemp:
+        root = Path(config.rootpath) / "reports" / "pytest-tmp"
+        # 目录必须**先建出来**：pytest 拿到显式 basetemp 时只会清空、不会创建，
+        # 而它下面还要再建 per-test 子目录，父目录不存在就 FileNotFoundError。
+        root.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = str(root / f"run-{time.time_ns()}")
+
 
 if TYPE_CHECKING:
     from fastapi import FastAPI

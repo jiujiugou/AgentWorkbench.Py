@@ -273,9 +273,9 @@ def test_the_refusal_is_recorded_with_its_own_reason(
 
 
 def test_the_check_happens_before_field_validation(admin_client: TestClient) -> None:
-    """非所有者发一个**缺字段**的请求 → 403，不是 422。
+    """非所有者发一个**缺字段**的请求 → 403，不是 400。
 
-    422 会说「这个端点要 `name` 与 `baseUrl`」，403 什么都不说。这条靠
+    400 会说「这个端点要 `name` 与 `baseUrl`」，403 什么都不说。这条靠
     `dependencies=[...]`（依赖先于字段校验）与「函数体第一行」的区别——后者的
     顺序是「pydantic 先校验一遍，再在函数体里被拒」，于是非所有者能读到字段清单。
 

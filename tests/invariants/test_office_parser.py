@@ -34,6 +34,7 @@ from io import BytesIO
 import pytest
 from docx import Document
 from openpyxl import Workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 from agentworkbench.core.documents import DocumentErrorCode
 from agentworkbench.ingest.parsing.dispatch import UnsupportedFormat, parse_document
@@ -296,3 +297,59 @@ def test_rows_are_capped() -> None:
     assert "行4" in body
     assert "行5" not in body, "上限之外的行被读进来了"
     assert "截断" in body, "截断了却没说，用户会以为整张表都在"
+
+
+# ── D9：合并区域病态时不能把解析线程烧掉（红队 C 的 R-03） ──
+
+
+def test_a_pathological_merge_area_is_parsed_in_streaming_mode() -> None:
+    """51KB 的 xlsx、合并区 `A2001:Z20000`（46.8 万格）必须秒回，不是 12 秒。
+
+    改坏这里会怎样：把 `read_only=streaming` 去掉，openpyxl 会在 `load_workbook`
+    里把每一格合并区域物化成 `MergedCell`——D9 实测 12.5 秒，而且这 12 秒
+    与文件大小无关（文件只有 51KB，远在 30MB 上限之内）。按线性外推
+    `A2001:Z200000` 是 3~4 分钟，`A1:XFD1048576` 是 170 亿格。
+    **注意修的不是 `_merged_fills`**：那一段在加载之后才跑，救不了加载期。
+
+    同时断言正文里说清了降级（少掉合并填充），不能静默。
+    """
+    import time
+
+    workbook = Workbook()
+    sheet = workbook.active
+    assert isinstance(sheet, Worksheet), "默认 sheet 应当是普通工作表"
+    sheet["A1"] = "参数"
+    sheet.merge_cells("A2001:Z20000")
+    buffer = BytesIO()
+    workbook.save(buffer)
+    data = buffer.getvalue()
+    assert len(data) < 100_000, "探针文件应当很小——这条讲的正是「小文件大代价」"
+
+    started = time.perf_counter()
+    pages = parse_document(data, ".xlsx")
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 5.0, f"解析用了 {elapsed:.1f} 秒，说明没走流式读取"
+    assert "合并单元格过多" in pages[0], "降级要写在正文里，否则用户以为表格本来就这样"
+    assert "参数" in pages[0], "降级不能把正文也丢掉"
+
+
+def test_normal_merges_still_fill_every_row() -> None:
+    """反证：小范围合并仍然要填到每一行——不能为了防大文件把正常能力改没。
+
+    这条与上面那条是一对：只测「大文件变快」的话，把合并填充整个删掉也能过。
+    """
+    workbook = Workbook()
+    sheet = workbook.active
+    assert isinstance(sheet, Worksheet), "默认 sheet 应当是普通工作表"
+    sheet["A1"] = "焊接"
+    sheet["B1"] = "参数"
+    sheet.merge_cells("A1:A3")
+    sheet["B2"] = "电流"
+    sheet["B3"] = "电压"
+    buffer = BytesIO()
+    workbook.save(buffer)
+
+    page = parse_document(buffer.getvalue(), ".xlsx")[0]
+
+    assert page.count("焊接") == 3, f"合并区没填到每一行：{page!r}"

@@ -112,6 +112,8 @@ class ReasonCode(StrEnum):
     **刻意不与 `role_insufficient` 合并**：运维看到前者会去找该团队的管理员，
     而这件事找团队管理员没有用——他在自己的团队里权限再高也改不了全平台配置。
     合并之后，记录里所有 403 长得一样，而处置方式相反的两种拒绝并成了一种。"""
+    PASSWORD_CHANGE_REQUIRED = "password_change_required"  # noqa: S105 —— 原因码，不是口令
+    """「你还没改初始口令」。它也是 403，但处置动作是改密，不是找人授权。"""
     BOOTSTRAP_CLOSED = "bootstrap_closed"
     RESOURCE_MISSING = "resource_missing"
     """「按这个 id 取不到」的唯一理由。
@@ -167,6 +169,7 @@ class Account:
     lockout_until: datetime | None = None
     failed_attempts: int = 0
     is_platform_admin: bool = False
+    must_change_password: bool = False
 
     @property
     def normalized_email(self) -> str:
@@ -224,6 +227,7 @@ class Principal:
     credential_epoch: int
     lockout_until: datetime | None = None
     is_platform_admin: bool = False
+    must_change_password: bool = False
 
 
 @dataclass(frozen=True)

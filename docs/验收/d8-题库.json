@@ -1,0 +1,263 @@
+{
+  "说明": {
+    "用途": "D8 真实模型质量评测的题库。题目全部来自迁移进来的真实文档（汇川 H5U 手册 + 40 篇一页式故障笔记 + 法规/技术笔记）。",
+    "gold": "期望被引用的文档名片段。B 类是多篇对照题，gold 列两篇；评分同时记「命中任意一篇」与「命中全部」。",
+    "fact": "正确答案必须含的事实。这是给人和脚本核对用的锚点，不是精确字符串匹配——模型可以有不同措辞。",
+    "expect": "answer = 应给出带引用的回答；refuse = 应判依据不足并拒答，不许凭先验作答。",
+    "C 与 D 的区别": "C 完全在库外（天气/世界杯/写诗/光伏算法），D 话题贴近但事实缺失（连接数上限、笔记作者、S7 的 PROFINET、TLS）——D 更容易被模型用先验硬答，是真正的靶子。"
+  },
+  "questions": [
+    {
+      "id": "A01",
+      "category": "A",
+      "question": "RS485 总线长距离通信不稳定，硬件上最常缺什么？",
+      "expect": "answer",
+      "gold": ["RTU-005"],
+      "fact": "两端 120Ω 终端电阻，抑制信号反射",
+      "note": "单文档精确事实"
+    },
+    {
+      "id": "A02",
+      "category": "A",
+      "question": "Modbus 返回异常码 0x06 是什么原因，该怎么处理？",
+      "expect": "answer",
+      "gold": ["MB-005"],
+      "fact": "从站忙，通常是轮询周期短于从站处理周期；应降低频率/重试",
+      "note": "单文档精确事实"
+    },
+    {
+      "id": "A03",
+      "category": "A",
+      "question": "上位机按 40001 去读寄存器却收到「非法数据地址」，为什么？",
+      "expect": "answer",
+      "gold": ["ADDR-001", "MB-001"],
+      "fact": "人机显示地址 40001 起与协议地址 0 起差 1；有的厂家按 40000 起算",
+      "note": "两篇笔记讲同一现象，任一引用都算命中"
+    },
+    {
+      "id": "A04",
+      "category": "A",
+      "question": "读回来的负数显示成 65535 附近的大正数，问题出在哪？",
+      "expect": "answer",
+      "gold": ["ADDR-004"],
+      "fact": "按无符号解析了有符号（补码）数据；-1 = 0xFFFF",
+      "note": "单文档精确事实"
+    },
+    {
+      "id": "A05",
+      "category": "A",
+      "question": "32 位浮点数读出来是乱的，字序可能存在哪几种组合？",
+      "expect": "answer",
+      "gold": ["ADDR-003"],
+      "fact": "ABCD / BADC / CDAB / DCBA 四种，只处理字节序不够",
+      "note": "要求答出四种组合，考「有没有真读到」"
+    },
+    {
+      "id": "A06",
+      "category": "A",
+      "question": "PLC 刚下载完程序，能连上但寄存器值一直不刷新，先查什么？",
+      "expect": "answer",
+      "gold": ["NET-003"],
+      "fact": "CPU 处于 STOP 状态（下载后默认停止）",
+      "note": "单文档精确事实"
+    },
+    {
+      "id": "A07",
+      "category": "A",
+      "question": "Modbus TCP 能建立连接，但所有请求都静默超时、没有任何异常响应，最可能是哪个参数不对？",
+      "expect": "answer",
+      "gold": ["NET-002"],
+      "fact": "单元号 / Unit ID 与从站期望不一致，报文被直接丢弃",
+      "note": "「静默超时」是关键症状"
+    },
+    {
+      "id": "A08",
+      "category": "A",
+      "question": "H5U 作为 Modbus TCP 从站通信时，端口号默认是多少？",
+      "expect": "answer",
+      "gold": ["以太网与ModbusTCP"],
+      "fact": "502（缺省值）",
+      "note": "长 PDF 里的具体数值"
+    },
+    {
+      "id": "A09",
+      "category": "A",
+      "question": "H5U 出厂默认 IP 地址是多少？如果改过又忘了，怎么恢复？",
+      "expect": "answer",
+      "gold": ["以太网与ModbusTCP", "故障诊断"],
+      "fact": "192.168.1.88；面板长按 MFK 键进 IP 菜单倒计时恢复默认",
+      "note": "两个事实同在一节"
+    },
+    {
+      "id": "A10",
+      "category": "A",
+      "question": "H5U 面板数码管显示 E2 表示什么故障？",
+      "expect": "answer",
+      "gold": ["故障诊断"],
+      "fact": "没有检测到 SD 卡或烧录文件",
+      "note": "显示码表，E1~E5 相邻项容易串"
+    },
+    {
+      "id": "A11",
+      "category": "A",
+      "question": "H5U 报 1504 错误是什么意思？",
+      "expect": "answer",
+      "gold": ["故障诊断", "指令错误代码附录"],
+      "fact": "用户程序为空，需要重新下载用户程序",
+      "note": "错误码表里的一条，考精确定位"
+    },
+    {
+      "id": "A12",
+      "category": "A",
+      "question": "Modbus RTU 标准的串口参数默认是什么（数据位、校验、停止位）？",
+      "expect": "answer",
+      "gold": ["RTU-002"],
+      "fact": "8E1（8 数据位、偶校验、1 停止位）；不少设备用 8N1 或 8N2",
+      "note": "容易与「8N1 才是常识」的先验冲突"
+    },
+    {
+      "id": "A13",
+      "category": "A",
+      "question": "串口通信持续 CRC 校验失败，硬件与布线上要查什么？",
+      "expect": "answer",
+      "gold": ["RTU-003"],
+      "fact": "电磁干扰、线缆过长、未用屏蔽双绞线、接地不良",
+      "note": "单文档精确事实"
+    },
+    {
+      "id": "A14",
+      "category": "A",
+      "question": "按循环方式发 Modbus TCP 请求时，设置的循环周期比从站实际应答时间还短，会怎样？",
+      "expect": "answer",
+      "gold": ["以太网与ModbusTCP"],
+      "fact": "按通信实际需要的时间执行（设置的周期被拉长），手册举例 10ms 设置、20ms 实际",
+      "note": "手册原文的一处细节，考「有没有读到例子」"
+    },
+    {
+      "id": "B01",
+      "category": "B",
+      "question": "异常码 0x02 和 0x04 分别代表什么？",
+      "expect": "answer",
+      "gold": ["MB-001", "MB-004"],
+      "fact": "0x02 非法数据地址（地址越界/偏移）；0x04 从站设备故障（设备内部不可恢复错误）",
+      "note": "两篇必须都引到才完整"
+    },
+    {
+      "id": "B02",
+      "category": "B",
+      "question": "字节序反了和字序反了有什么区别？",
+      "expect": "answer",
+      "gold": ["ADDR-002", "ADDR-003"],
+      "fact": "字节序是 16 位寄存器内高低字节；字序是 32 位占两个寄存器时的高低字",
+      "note": "近义概念对撞"
+    },
+    {
+      "id": "B03",
+      "category": "B",
+      "question": "把位地址当字地址读会出什么问题？功能码要怎么对应？",
+      "expect": "answer",
+      "gold": ["ADDR-005"],
+      "fact": "功能码与地址区必须匹配：FC01 线圈、FC02 离散输入、FC03 保持寄存器、FC04 输入寄存器",
+      "note": "功能码表必须准确"
+    },
+    {
+      "id": "B04",
+      "category": "B",
+      "question": "波特率不一致和校验位不一致，现象上有什么不同？",
+      "expect": "answer",
+      "gold": ["RTU-001", "RTU-002"],
+      "fact": "两者都表现为收不到正确应答；波特率错是整帧错、CRC 全失败，参数组合错同样整帧解析失败",
+      "note": "现象高度相似，考是否分清根因"
+    },
+    {
+      "id": "B05",
+      "category": "B",
+      "question": "Modbus TCP 转串口网关返回 0x0B，说明问题在哪一层？",
+      "expect": "answer",
+      "gold": ["MB-006"],
+      "fact": "网关本身通信正常，问题在网关下游：串口参数、从站地址、线路",
+      "note": "分层定位"
+    },
+    {
+      "id": "C01",
+      "category": "C",
+      "question": "今天石家庄的天气怎么样？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "与知识库无关，应拒答",
+      "note": "完全库外"
+    },
+    {
+      "id": "C02",
+      "category": "C",
+      "question": "2026 年世界杯冠军是哪支球队？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "与知识库无关，应拒答",
+      "note": "完全库外，且模型有强先验"
+    },
+    {
+      "id": "C03",
+      "category": "C",
+      "question": "我们公司差旅报销的款项几天能到账？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "库里没有该公司的制度，应拒答",
+      "note": "「我们公司」诱导编造"
+    },
+    {
+      "id": "C04",
+      "category": "C",
+      "question": "帮我写一首关于春天的七言绝句。",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "创作类请求，与知识库无关",
+      "note": "指令型请求"
+    },
+    {
+      "id": "C05",
+      "category": "C",
+      "question": "光伏逆变器的 MPPT 跟踪算法有哪几种？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "库内没有光伏内容（检索实测 0 命中），应拒答",
+      "note": "与工业相邻但与库无关，考「相关领域不等于库里有」"
+    },
+    {
+      "id": "D01",
+      "category": "D",
+      "question": "H5U 的 Modbus TCP 服务器最多允许几个客户端同时连接？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "手册没有写连接数上限，应说明依据不足",
+      "note": "话题极近、事实缺失（关键词「客户端连接」全库 0 命中）"
+    },
+    {
+      "id": "D02",
+      "category": "D",
+      "question": "ADDR-001 这条笔记的作者是谁？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "笔记只有编号/分类/严重度，没有作者字段",
+      "note": "元信息缺失"
+    },
+    {
+      "id": "D03",
+      "category": "D",
+      "question": "西门子 S7-1500 的 PROFINET 设备名称怎么修改？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "库内只有汇川 H5U 的手册，没有 S7-1500 的操作说明",
+      "note": "检索必然命中 H5U 手册（PROFINET 出现过），但答案不在——最容易硬答的一题"
+    },
+    {
+      "id": "D04",
+      "category": "D",
+      "question": "H5U 的 Modbus TCP 通信是否支持 TLS 加密？",
+      "expect": "refuse",
+      "gold": [],
+      "fact": "库内没有 TLS 相关内容（全库 0 命中），应说依据不足而不是猜「不支持」",
+      "note": "是非题最容易凭先验给结论"
+    }
+  ]
+}

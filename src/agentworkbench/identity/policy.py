@@ -185,6 +185,7 @@ def judge_access(
         credential_epoch=account.credential_epoch,
         lockout_until=account.lockout_until,
         is_platform_admin=account.is_platform_admin,
+        must_change_password=account.must_change_password,
     )
 
     # ② 账户：只判 status。停止的账户连同已签发会话一起失效（那是「踢」的本意）；

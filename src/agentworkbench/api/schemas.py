@@ -48,6 +48,16 @@ class UserDto(ApiModel):
     tenant_id: str
 
 
+class AuthUserDto(UserDto):
+    """登录 / me 的返回。**只在身份端点加这一列**。
+
+    成员列表仍用 `UserDto`：谁还没改初始口令不是同事需要知道的信息，
+    而且那会让“成员列表”的形状随身份状态变化。
+    """
+
+    must_change_password: bool
+
+
 class DocumentDto(ApiModel):
     id: str
     file_name: str

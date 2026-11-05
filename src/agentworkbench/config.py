@@ -32,13 +32,41 @@ class AuthSettings(BaseModel):
     `ticket_ttl_hours=0` 是票据一签发就过期，两者都不会报错。
     `session_invalidate_seconds` 允许 0，那是「不缓存、吊销立即生效」，
     测试拿确定性正是靠它（§1.5）。
+
+    **`session_invalidate_seconds` 的默认值是 0（D9 由 60 改为 0）**：本地 SQLite 上
+    一次判定是几十微秒，而 60 秒窗口的代价是「被停用的管理员在一个窗口内还能改
+    别人的角色」——窗口是临时的，那次改角色的结果不是。要窗口就显式配，
+    并接受「吊销最多滞后 N 秒」这个语义（`identity/sessions.py` 里写清了）。
     """
 
-    session_invalidate_seconds: int = Field(default=60, ge=0)
+    session_invalidate_seconds: int = Field(default=0, ge=0)
     login_max_failures: int = Field(default=5, ge=1)
     lockout_seconds: int = Field(default=900, ge=1)
     ticket_ttl_hours: int = Field(default=12, ge=1)
     cookie_secure: bool = False
+
+
+class EmbeddingSettings(BaseModel):
+    """向量化端点的三要素 + 两个批次旋钮。环境变量 `AWB_EMBEDDING__BASE_URL` 等。
+
+    **三项全空是合法状态**：那就是"没配"，装配层退回占位嵌入 `HashEmbedder`
+    并在启动日志里明确写出来。它合法但不等于没差别——占位嵌入的语义相似度是假的
+    （sha256 派生），语义检索会退化成随机邻居。所以装配层不是静默退回，
+    而是落一条 WARNING 并让 `/api/settings/embedding` 显示实际的模式。
+    """
+
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: float = Field(default=20.0, gt=0)
+    batch_size: int = Field(default=32, ge=1)
+
+    @property
+    def configured(self) -> bool:
+        """地址与模型都在才算配了。只有 key 或只有地址都按"没配"处理——
+        半配置去发请求的失败形态是每份文档都标 `index_transient`，
+        看起来像"上游挂了"，实际是配置少填一半。"""
+        return bool(self.base_url.strip() and self.model.strip())
 
 
 class Settings(BaseSettings):
@@ -83,13 +111,19 @@ class Settings(BaseSettings):
     # `refuse_margin` = 「第 2~5 名平均距离 − 第一名」的下限，低于它就判不足；
     # `sufficient_distance` = 第一名距离的上限，够近才算答得上。
     #
-    # ⚠️ 这两个默认值是**临时口径**：G15 要求「空阈值进程起不来」，也就是没有
-    # 默认值、缺了直接报错。之所以还没那么做，是因为模块级 `app = create_app()`
-    # 会让任何 import 本模块的测试一起炸——那条要连同 G15 的另外三条防空分支
-    # 机制（探针用例、评测报四值分布、改坏法）一起做，不在 F4 的范围里。
-    # 现在给默认值至少保证阈值**有消费者**（runner.ask 直接用），不是配了不读。
-    refuse_margin: float = 0.10
-    sufficient_distance: float = 0.50
+    # 2026-11-05（D8）用 28 道真实题在 bge-m3 上标定过一次，取值与依据：
+    # - 可答题首名距离 0.266~0.406（中位 0.338），间隔 0.012~0.154；
+    # - 库外题首名 0.381~0.703，间隔 −0.021~0.092；
+    # - **两个阈值都无法单独分开两类**（相邻领域的库外题比换个说法的可答题更近），
+    #   网格扫描里没有「误拒 0 且误答 0」的格子。
+    # 0.05 / 0.45 是在「误答优先于误拒」这一产品立场下选的：19 道可答题答出 13 道
+    # （引用全部命中），9 道应拒答拦住 8 道，唯一漏过的那道模型自己也说了「资料不足」。
+    # 证据 `reports/acceptance/2026-11-05/d8-quality.md` §阈值扫描。
+    #
+    # ⚠️ 换嵌入模型必须重新标定：这两个数在余弦距离尺度上有意义，换模型（甚至换
+    # 维度）后距离分布整体平移，抄过来的阈值既不报错也不准。
+    refuse_margin: float = 0.05
+    sufficient_distance: float = 0.45
 
     # 二级校验（引用内容真的支持这句话吗）的覆盖率阈值。
     # **默认 None 是合法的**：表示"没定标、只记数值不判"（D-12）。
@@ -100,6 +134,18 @@ class Settings(BaseSettings):
 
     # vite dev server 的源。生产由同一个进程托管静态文件，不需要跨域。
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    # 向量化端点（OpenAI 兼容 `/embeddings`）。
+    #
+    # 为什么凭据走环境变量而不是库里的 `providers` 表：`providers` 是**聊天**供应商
+    # 的配置面（有一行激活、有默认模型），向量化没这些形态——它是单例、全局、
+    # 建索引时才用。硬塞进同一张表要加 `kind` 列并重做「唯一激活」索引，
+    # 而它换来的只是省一个环境变量。长期该并进容量更大的那张表，不是现在。
+    #
+    # 为什么**维度不在**这里：`vec0` 的维度由 `core/vectors.EMBEDDING_DIM` 在建表时
+    # 固定，配一个和它对不上的数字只会让每次写索引都失败。维度是常量不是旋钮——
+    # 换模型换维度 = 改常量 + 重建索引，两件事都得做，配成可改反而像能单独改。
+    embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
 
     # 前端构建产物目录。None = 不托管（纯 API / 开发态）；`serve` 命令默认
     # 指向 `./web/dist`（不存在则日志警告、API 照常）。托管是同源的，

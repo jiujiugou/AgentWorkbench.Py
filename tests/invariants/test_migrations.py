@@ -56,3 +56,40 @@ def test_alembic_initial_matches_create_schema(tmp_path: Path) -> None:
 
     migrated.close()
     direct.close()
+
+
+def test_create_schema_adds_the_flag_to_an_unversioned_old_database(tmp_path: Path) -> None:
+    """没有 `alembic_version` 的老库也要能补上首登标记。
+
+    这条针对的是当前真实部署形态：库是 `create_schema` 建的，没有版本表，
+    `alembic upgrade head` 会从 0001 重跑并撞上已存在的表。启动期只做
+    **向后兼容的加列**，老账号默认 0；重复执行不能炸。
+    """
+    path = tmp_path / "legacy.db"
+    conn = engine.connect(path)
+    try:
+        conn.executescript(
+            "create table users ("
+            " id text primary key, tenant_id text not null, email text not null,"
+            " password_hash text not null, role text not null, status text not null,"
+            " credential_epoch integer not null default 1, lockout_until text,"
+            " failed_attempts integer not null default 0,"
+            " is_platform_admin integer not null default 0,"
+            " created_at text not null, updated_at text not null);"
+            "insert into users (id, tenant_id, email, password_hash, role, status,"
+            " credential_epoch, lockout_until, failed_attempts, is_platform_admin,"
+            " created_at, updated_at)"
+            " values ('u-old','t1','old@example.com','h','admin','active',1,null,0,1,'t','t');"
+        )
+        conn.commit()
+
+        engine.create_schema(conn)
+        engine.create_schema(conn)  # 幂等：第二次不能 duplicate column
+
+        columns = [str(row[1]) for row in conn.execute("pragma table_info(users)")]
+        assert columns.count("must_change_password") == 1
+        row = conn.execute("select must_change_password from users where id = 'u-old'").fetchone()
+        assert row is not None
+        assert int(row[0]) == 0
+    finally:
+        conn.close()

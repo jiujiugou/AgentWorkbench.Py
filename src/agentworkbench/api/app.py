@@ -19,8 +19,10 @@ import logging
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from agentworkbench.api import errors, refusals
 from agentworkbench.api.deps import Deps, build_deps
@@ -33,7 +35,7 @@ from agentworkbench.api.routes import conversations, documents, identity, knowle
 from agentworkbench.api.routes import settings as settings_api
 from agentworkbench.api.spa_static import mount_spa
 from agentworkbench.config import Settings
-from agentworkbench.core.errors import AppError, ErrorCode
+from agentworkbench.core.errors import ERROR_SPECS, AppError, ErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,49 @@ def _request_id_of(request: Request) -> str:
     """从 scope.state 取 request_id。中间件未挂时给空串而不是炸——
     错误响应永远要比中间件更皮实。"""
     return str(getattr(request.state, "request_id", "") or "")
+
+
+_TYPE_HINTS: dict[str, str] = {
+    "string_type": "应为字符串",
+    "string_too_long": "超长",
+    "string_too_short": "为空",
+    "missing": "缺失",
+    "int_parsing": "应为整数",
+    "int_type": "应为整数",
+    "bool_type": "应为布尔值",
+    "json_invalid": "不是合法的 JSON",
+    "model_attributes_type": "应为对象",
+    "list_type": "应为数组",
+}
+"""pydantic 错误类型 → 给人看的一句话。**只翻类型，不翻值。**
+
+漏掉某个类型不是灾难（落到默认的「不合法」），而把 `input` 抄进来是——见
+`_validation_message` 的 docstring。
+"""
+
+
+def _validation_message(exc: RequestValidationError) -> str:
+    """把 pydantic 的错误清单压成一句人能看懂、且**不回显提交值**的话。
+
+    这是 D6 抓到的一个真实泄露：FastAPI 默认的 422 体是
+    `{"detail": [{"loc": [...], "input": <客户端提交的原值>}]}`。
+    提交一个 `apiKey: {"nested": "sk-..."}`（类型错、值对）时，那个哨兵会被
+    原样放进响应体——浏览器 devtools、反代访问日志、前端错误上报里都会留一份。
+    「密钥不回传」这条判据按字面就不成立了。
+
+    所以这里只取 `loc`（字段路径）与 `type`（错误种类），`input` / `ctx` 一概不碰；
+    客户端本来就知道自己提交了什么，它需要的是**哪个字段错了**，不是再看一遍原值。
+    """
+    parts: list[str] = []
+    for error in exc.errors():
+        loc = [str(item) for item in error.get("loc", ()) if item not in ("body", "query", "path")]
+        field = ".".join(loc) or "请求体"
+        hint = _TYPE_HINTS.get(str(error.get("type", "")), "不合法")
+        parts.append(f"{field}（{hint}）")
+    # 同一条请求里同一个字段只报一次：整份 body 缺字段时会列出十几个，
+    # 拼成一整句反而看不出该改哪个。
+    unique = list(dict.fromkeys(parts))
+    return "请求字段不合法：" + "、".join(unique[:5]) + "。"
 
 
 def create_app(
@@ -77,6 +122,69 @@ def create_app(
 
     app.state.deps = deps if deps is not None else build_deps(cfg)
 
+    @app.exception_handler(RequestValidationError)
+    async def on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        """请求体/查询参数校验失败 → 与业务错误同一套五字段信封。
+
+        **不用框架默认的 422**，两个理由（D6 实测）：
+
+        1. **默认体会回显提交值**（`input` 字段），凭据类字段一旦类型写错就被
+           原样回给客户端——「密钥不回传」在错误路径上直接破功。
+        2. **默认体没有 `message`**：前端 `parseError` 只认 `message`，
+           于是用户看到的是 `{"detail":[...]}` 这段原文（里面正是他的 key）。
+
+        状态码用 400 而不是 422：`ERROR_SPECS` 里 `validation_failed` 就是 400，
+        一个码只对应一个状态码这条约束（`core/errors.py` 模块 docstring）不能为了
+        框架默认值开口子。代价是「畸形 JSON 从 422 变 400」——这在语义上更准，
+        且没有任何调用方依赖过 422（前端只读 `message`）。
+        """
+        message = _validation_message(exc)
+        request_id = _request_id_of(request)
+        logger.info(
+            "请求校验失败 path=%s request_id=%s detail=%s",
+            request.url.path,
+            request_id,
+            message,
+        )
+        return JSONResponse(
+            status_code=400,
+            content=errors.body_of(AppError(ErrorCode.VALIDATION_FAILED, message), request_id),
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def on_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        """框架自己抛的 `HTTPException` → 同样五字段信封。
+
+        为什么需要这一条：`AppError` 那个 handler 只覆盖**我们主动抛**的异常。
+        未匹配的路径（`GET /api/nope`）、路径编码后不再匹配路由（`/api/documents/a%2Fb`）、
+        方法不对（`PUT /api/health`）走的是 Starlette 的默认实现，返回
+        `{"detail": "Not Found"}`——**没有 `message`、没有 `request_id`**。
+        前端 `parseError` 只认 `message`，于是用户看到的是这段 JSON 原文；
+        而且这种失败无法按 request_id 去日志里定位。
+
+        **405 也归到 404**（同一个码、同一个状态）：这个产品的既有取向是
+        「不确认某个路径存不存在」——`/api/documents/{别人的 id}` 与不存在都是 404。
+        方法不对若单独回 405，等于告诉未登录的人「这个路径是真的」，
+        而那正是一条不需要权限就能做的探测。
+        """
+        request_id = _request_id_of(request)
+        method_mismatch = exc.status_code in (404, 405)
+        if not method_mismatch and exc.status_code >= 500:
+            code = ErrorCode.INTERNAL_ERROR
+        else:
+            code = ErrorCode.NOT_FOUND
+        spec = ERROR_SPECS[code]
+        return JSONResponse(
+            status_code=spec.http_status,
+            content={
+                "code": str(code),
+                "http_status": spec.http_status,
+                "message": "这个路径不支持该方法。" if exc.status_code == 405 else "路径不存在。",
+                "retryable": spec.retryable,
+                "request_id": request_id,
+            },
+        )
+
     @app.exception_handler(errors.UploadRejected)
     async def on_upload_rejected(request: Request, exc: errors.UploadRejected) -> JSONResponse:
         return JSONResponse(status_code=400, content=errors.body_of(exc, _request_id_of(request)))
@@ -91,6 +199,22 @@ def create_app(
         """
         request_id = _request_id_of(request)
         status = errors.status_of(exc)
+        # S-H2 的后半句「日志里有」：一次失败必须能按客户端贴来的 request_id 翻到，
+        # 否则「响应里带 request_id」只是把一个无处可查的编号印在响应上。
+        # 此前只有 500 兜底路径写日志，503（模型不可用 / 未配置 / 索引待重建）
+        # 一条都不留——D6 真跑不可达端点时按 request_id 查不到任何东西。
+        #
+        # 5xx 归运维（warning），4xx 归调用方（info）；**不记 message 原文的请求体**：
+        # 日志的用途是「这次请求怎么了」，不是把用户提交的内容再存一份。
+        log = logger.warning if status >= 500 else logger.info
+        log(
+            "请求失败 code=%s status=%s path=%s request_id=%s reason=%s",
+            exc.code.value,
+            status,
+            request.url.path,
+            request_id,
+            exc.reason or "-",
+        )
         if status in refusals.REFUSAL_STATUSES:
             try:
                 refusals.record(request, exc)

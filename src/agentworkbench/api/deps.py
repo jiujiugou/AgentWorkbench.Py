@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -23,16 +24,20 @@ from pathlib import Path
 
 from agentworkbench.config import Settings
 from agentworkbench.core.clock import utc_now
+from agentworkbench.core.errors import AppError, ErrorCode
 from agentworkbench.db import crypto, engine
 from agentworkbench.db.repositories import providers as provider_repo
+from agentworkbench.db.repositories import system_state
 from agentworkbench.identity import service
 from agentworkbench.identity.sessions import SessionCache
 from agentworkbench.ingest.queue import InMemoryQueue
 from agentworkbench.ingest.storage import LocalStorage
 from agentworkbench.ingest.worker import EmbedderPort, ParserPort
 from agentworkbench.llm.client import ChatClient, OpenAIChatClient
-from agentworkbench.llm.embeddings import HashEmbedder
+from agentworkbench.llm.embeddings import EmbeddingEndpoint, HashEmbedder, OpenAIEmbedder
 from agentworkbench.llm.providers import ChatEndpoint
+
+logger = logging.getLogger(__name__)
 
 # 时间戳格式的定义在 core/clock.py：trace 层也要写时间，而它不能 import api。
 # 这里重新导出，是为了让路由继续 `from agentworkbench.api.deps import Deps, utc_now`——
@@ -68,11 +73,24 @@ def _chat_for(secret: str) -> ChatFactory:
 
     def factory(conn: sqlite3.Connection) -> tuple[ChatClient, str]:
         row = provider_repo.resolve_active_row(conn)
+        try:
+            api_key = crypto.decrypt(secret, row["api_key_encrypted"])
+        except ValueError as exc:
+            # 换过 AWB_SECRET_KEY（或库来自另一套密钥）时，此前这里一路冒泡成
+            # 「500 服务器内部错误 + retryable=True」：用户看到的是「稍后重试」，
+            # 而重试一万次都不会好，真正该看到的「重新保存一次凭据」只留在日志里。
+            # 这属于配置失效，按 S-V9 的口径是 503 + 不可重试。
+            raise AppError(
+                ErrorCode.MODEL_NOT_CONFIGURED,
+                "供应商凭据无法解密：当前服务密钥与库里的密文不匹配"
+                "（密钥换过，或库是另一套密钥加密的）。重新保存一次供应商 API Key 即可恢复。",
+                reason="credential_decrypt_failed",
+            ) from exc
         endpoint = ChatEndpoint(
             provider_id=int(row["id"]),
             name=str(row["name"]),
             base_url=str(row["base_url"]),
-            api_key=crypto.decrypt(secret, row["api_key_encrypted"]),
+            api_key=api_key,
             model=str(row["model"]),
         )
         return OpenAIChatClient(endpoint), endpoint.model
@@ -108,6 +126,64 @@ class Deps:
         return engine.connect(self.settings.db_path)
 
 
+def _embedder_for(settings: Settings) -> EmbedderPort:
+    """按配置选向量化实现。**没配就用占位实现，但要说出来。**
+
+    退回 `HashEmbedder` 时落 WARNING，不落 INFO、不静默：它的语义相似度是假的，
+    检索会退化成"随机邻居"，而界面上一切正常——这类"看起来在工作"的降级
+    只能靠日志和这条注释拦住下一个人。
+    """
+    config = settings.embedding
+    if not config.configured:
+        logger.warning(
+            "未配置 AWB_EMBEDDING__BASE_URL / AWB_EMBEDDING__MODEL：使用占位嵌入 HashEmbedder，"
+            "语义检索不可用（相似度由 sha256 派生，同义词不会靠近）"
+        )
+        return HashEmbedder()
+    logger.info("向量化端点：%s，模型 %s", config.base_url, config.model)
+    return OpenAIEmbedder(
+        EmbeddingEndpoint(
+            base_url=config.base_url.strip(),
+            api_key=config.api_key.strip(),
+            model=config.model.strip(),
+        ),
+        timeout=config.timeout_seconds,
+        batch_size=config.batch_size,
+    )
+
+
+def _align_embedding_state(conn: sqlite3.Connection, embedder: EmbedderPort) -> None:
+    """让 `system_state` 里的「想要的模型」等于**配置里真在用的**那个。
+
+    不做这一步，设置页显示的是一个值、实际算向量的是另一个——那正是
+    `/api/settings/embedding` 此前"配了不读"的形态（写了模型名，没有任何代码读它）。
+
+    `embedding.synced`（索引实际用的）只在**能确定**的时候写：
+    - 库是空的 → 没有索引可重建，写成本模型就是事实；
+    - 库里已有片段、而 synced 是空的 → **不知道那些向量是谁算的**，写成 `(未配置)`
+      让 `index_is_stale` 判真，检索宁可报 `index_stale` 也不要在错的空间里相似度匹配。
+      修法是重建索引（全量重解析），不是忽略这条。
+    """
+    model = getattr(embedder, "model", None)
+    if not isinstance(model, str) or not model:
+        return  # 占位嵌入没有"模型身份"，不动状态（老库/评测库的形态）
+    wanted, synced = system_state.embedding_state(conn)
+    if synced is None:
+        has_chunks = conn.execute("select 1 from chunks limit 1").fetchone() is not None
+        synced = system_state.UNCONFIGURED if has_chunks else model
+        if has_chunks:
+            logger.warning(
+                "库里已有片段，但 `embedding.synced` 为空——无法确定这些向量是哪个模型算的。"
+                "已标为待重建：检索会报 index_stale，重建索引后恢复。"
+            )
+    if wanted == model and system_state.get(conn, system_state.EMBEDDING_SYNCED_KEY) is not None:
+        return
+    now = utc_now()
+    with conn:
+        system_state.put(conn, system_state.EMBEDDING_MODEL_KEY, model, now=now)
+        system_state.put(conn, system_state.EMBEDDING_SYNCED_KEY, synced, now=now)
+
+
 def build_deps(settings: Settings) -> Deps:
     """按配置建目录与实现。schema 在这里一次建齐。
 
@@ -123,12 +199,15 @@ def build_deps(settings: Settings) -> Deps:
     # create_schema 用 IF NOT EXISTS，对已有库是幂等的；真正的结构变更走 alembic。
     with closing(engine.connect(settings.db_path)) as conn:
         engine.create_schema(conn)
+    embedder = _embedder_for(settings)
+    with closing(engine.connect(settings.db_path)) as conn:
+        _align_embedding_state(conn, embedder)
     return Deps(
         settings=settings,
         storage=storage,
         queue=InMemoryQueue(),
         parser=_default_parser,
-        embedder=HashEmbedder(),  # 结构化满足 EmbedderPort
+        embedder=embedder,  # 结构化满足 EmbedderPort
         chat_factory=_chat_for(secret),
         auth=service.AuthConfig.from_settings(settings),
         session_cache=SessionCache(settings.auth.session_invalidate_seconds),

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 import sqlite_vec  # type: ignore[import-untyped]
@@ -244,6 +245,11 @@ CREATE TABLE IF NOT EXISTS users (
     -- 只能由引导路径写 1（§1.7 第 t5 步）。**没有任何接口能改它**：
     -- 存在授予入口，团队管理员就能自封，这条列等于不存在。
     is_platform_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_platform_admin IN (0, 1)),
+    -- 首登改密标记（REQ-AUTH-11 / I-V19）。它是**凭据轮换标记**，不是账户状态：
+    -- 不影响登录、status、lockout_until，也不进 ROLE_RANK。引导/管理员重置置 1，
+    -- 本人改密清 0；存量账号默认 0，升级后不被误伤。
+    must_change_password INTEGER NOT NULL DEFAULT 0
+        CHECK (must_change_password IN (0, 1)),
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -387,23 +393,87 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks_vec USING vec0(
 )
 
 
+WRITE_PROBE_ATTEMPTS = 6
+"""拿不到可写连接时最多重开几次。D6 实测：8 线程并发开新库，160 次里 133 次首次
+拿到的连接是"只读"的——重试 1~3 次内全部恢复（最长用到 3 次）。"""
+
+WRITE_PROBE_BUSY_MS = 10
+"""探测用的 busy_timeout（毫秒）。
+
+**不能沿用 5 秒**：探测要取一次写锁，5 秒会让每条读请求排在任何写者后面。
+10 毫秒足够区分三种结果——拿到锁（可写）、被判只读（立刻返回，不等待）、
+被别人挡住（BUSY，说明连接本身可写，只是现在轮不到）。
+"""
+
+
+def _is_writable(conn: sqlite3.Connection) -> bool:
+    """连接是不是**能写**的。`begin immediate` 是最便宜的问法。
+
+    只读的 WAL 连接在取写锁这一步就报 `SQLITE_READONLY`；被别的写者占着则报
+    `SQLITE_BUSY`——后者恰恰证明这条连接**没有**退化，只是现在轮不到它写。
+    把两者混为一谈会让「库正忙」变成「反复重开连接」，那才是真的把写堵死。
+    """
+    conn.execute(f"pragma busy_timeout = {WRITE_PROBE_BUSY_MS}")
+    try:
+        conn.execute("begin immediate")
+    except sqlite3.OperationalError as exc:
+        name = getattr(exc, "sqlite_errorname", "")
+        if name == "SQLITE_BUSY":
+            return True
+        if name == "SQLITE_READONLY":
+            return False
+        raise
+    conn.execute("rollback")
+    return True
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
-    """开连接：外键打开、WAL、加载 vec0。
+    """开连接：外键打开、WAL、加载 vec0，**并确认这条连接可写**。
 
     外键必须在这里打开。`ON DELETE CASCADE` 只在 `foreign_keys=ON` 时生效，
     而它是**连接级**开关：谁忘了开就留孤儿行，孤儿行不抛异常，只在检索时
     表现为"删了还能命中"。删除路径因此显式删三张表、不靠级联——但开关仍然要开。
+
+    ## 为什么要探测可写（D6 抓到的真问题）
+
+    WAL 模式要求每条连接把 `-shm` 映射进来。Windows 上多个线程同时开连接时，
+    这一步会偶发失败，而 SQLite 的降级方式是**把这条连接当成只读**——不报错、
+    不重试，等第一条 `update` 才炸 `SQLITE_READONLY: attempt to write a readonly
+    database`。用户看到的是随机 500，且只在并发时出现，单线程跑一万次都复现不了。
+
+    实测（SQLite 3.53.1 / Windows 11，8 线程各写一次）：
+
+    - 全新库、首个连接即并发：**133/160 次失败**
+    - `-shm` 已建立的热库：**7/160 次失败**
+    - 热库 + 一条常驻连接（`-shm` 一直映射）：**0/160**
+    - 本函数这套「探测 + 重开」：**0/160**（其中 117 次用了 1~3 次重试）
+
+    常驻连接也能治，但它要把一条连接挂到进程生命周期上：测试里每个 tmp 库一条，
+    进程结束时目录被锁住、清理报错。探测每次多一次 `begin/rollback`（微秒级），
+    代价小得多，也不需要谁记得关。
     """
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("pragma foreign_keys = on")
-    conn.execute("pragma journal_mode = wal")
-    # synchronous=normal 是 WAL 下的官方推荐：commit 不再强制 fsync，
-    # 掉电最多丢最后一个事务、库不会损坏。FULL 换来的那一层保护，
-    # 本产品用不上——单机工具，掉电重传一份文件即可。
-    conn.execute("pragma synchronous = normal")
-    load_vec(conn)
-    return conn
+    for attempt in range(WRITE_PROBE_ATTEMPTS):
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("pragma foreign_keys = on")
+        conn.execute("pragma journal_mode = wal")
+        # synchronous=normal 是 WAL 下的官方推荐：commit 不再强制 fsync，
+        # 掉电最多丢最后一个事务、库不会损坏。FULL 换来的那一层保护，
+        # 本产品用不上——单机工具，掉电重传一份文件即可。
+        conn.execute("pragma synchronous = normal")
+        load_vec(conn)
+        if _is_writable(conn):
+            conn.execute("pragma busy_timeout = 5000")
+            return conn
+        conn.close()
+        # 退避要短：这不是"库忙"，而是 -shm 映射竞争，下一次几乎必然成功。
+        # 太长会把并发请求拖成排队，太短则可能在同一次竞争里连撞几次。
+        time.sleep(0.002 * (attempt + 1))
+    raise sqlite3.OperationalError(
+        f"连接 {path} 连续 {WRITE_PROBE_ATTEMPTS} 次落在只读状态（WAL -shm 映射失败）。"
+        "通常是库文件被另一个进程以独占方式打开（同步网盘目录、杀毒软件扫描、"
+        "或另一份程序实例）。换一个本地目录再试。"
+    )
 
 
 def load_vec(conn: sqlite3.Connection) -> None:
@@ -413,7 +483,37 @@ def load_vec(conn: sqlite3.Connection) -> None:
     conn.enable_load_extension(False)
 
 
+def ensure_must_change_password_column(conn: sqlite3.Connection) -> bool:
+    """给已存在的 `users` 补上首登改密列。返回是否真的加过。
+
+    当前有一批生产库是 `create_schema` 建的，`alembic_version` 表不存在，
+    直接 `alembic upgrade head` 会从 0001 重跑并撞上已存在的表。所以启动期
+    只做**向后兼容的加列**：默认 0、不改已有行、重复执行是空操作。删列/改类型
+    /数据重写仍然只走 Alembic——这里不是第二条迁移通道。
+    """
+    columns = {str(row[1]) for row in conn.execute("pragma table_info(users)").fetchall()}
+    if "must_change_password" in columns:
+        return False
+    try:
+        conn.execute(
+            "alter table users add column must_change_password integer not null default 0"
+            " check (must_change_password in (0, 1))"
+        )
+    except sqlite3.OperationalError as exc:
+        # 两个进程同时启动时，另一个已经加过。只有这一种错误可以咽掉：
+        # 其他 OperationalError（磁盘满 / 锁死）必须让启动失败，不能假装成功。
+        if "duplicate column" not in str(exc).lower():
+            raise
+        return False
+    return True
+
+
 def create_schema(conn: sqlite3.Connection) -> None:
-    """建表。幂等，空库起服务时调一次。"""
+    """建表。幂等，空库起服务时调一次。
+
+    对已存在的库，这里只补**向后兼容的列**（见 `ensure_must_change_password_column`），
+    不替代 Alembic 的结构迁移。
+    """
     conn.executescript(SCHEMA_SQL)
+    ensure_must_change_password_column(conn)
     conn.commit()

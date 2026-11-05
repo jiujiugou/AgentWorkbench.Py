@@ -13,7 +13,7 @@
 |---|---|---|
 | 0 | 建成 | 一个团队 + 一个管理员 |
 | 1 | 引导已关闭（库里已有用户） | **一行都没变** |
-| 2 | 参数或环境不对（缺口令、口令为空） | 一行都没变 |
+| 2 | 参数或环境不对（缺口令、口令为空或太短） | 一行都没变 |
 
 1 与 2 分开，是因为运维要区分「我已经建过了」和「我命令敲错了」——
 两者的下一步动作完全相反。两种都是非零，都不会留下半个团队。
@@ -41,6 +41,7 @@ from agentworkbench.db import engine
 from agentworkbench.identity import service
 
 PASSWORD_ENV = "AWB_BOOTSTRAP_PASSWORD"  # noqa: S105 —— 环境变量名，不是口令本身
+MIN_PASSWORD_LENGTH = 12
 
 
 def _read_password() -> str | None:
@@ -81,6 +82,9 @@ def main(argv: list[str] | None = None) -> int:
     if not password or not password.strip():
         print("管理员口令不能为空。", file=sys.stderr)
         return 2
+    if len(password) < MIN_PASSWORD_LENGTH:
+        print(f"管理员初始口令至少 {MIN_PASSWORD_LENGTH} 位。", file=sys.stderr)
+        return 2
 
     settings = Settings()
     # 库文件在 data_dir 下；目录不存在时 sqlite 报「unable to open database file」,
@@ -97,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             password=password,
             tenant_name=tenant_name,
             now=datetime.now(UTC),
+            must_change_password=True,
         )
     except service.BootstrapClosed as exc:
         print(f"引导已关闭：{exc}", file=sys.stderr)
@@ -110,7 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  团队：    {result.tenant_id}（{tenant_name}）")
     print(f"  管理员：  {result.user_id}（{email}）")
     print(f"  数据库：  {settings.db_path}")
-    print("下一步：用这个邮箱和口令登录；邀请其他成员由管理员发起。")
+    print("下一步：用这个邮箱和初始口令登录；首次登录必须先修改口令。")
+    print("邀请其他成员由管理员发起。")
     return 0
 
 

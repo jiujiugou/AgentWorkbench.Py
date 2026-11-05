@@ -68,6 +68,7 @@ __all__ = [
     "revoke_ticket",
     "revoke_user_tickets",
     "set_lockout",
+    "set_must_change_password",
     "set_password_hash",
     "set_role",
     "set_status",
@@ -124,6 +125,7 @@ def _account(row: sqlite3.Row) -> Account:
         lockout_until=parse_stamp(row["lockout_until"]),
         failed_attempts=int(row["failed_attempts"]),
         is_platform_admin=bool(row["is_platform_admin"]),
+        must_change_password=bool(row["must_change_password"]),
     )
 
 
@@ -210,6 +212,7 @@ def insert_user(
     role: Role,
     now: datetime,
     is_platform_admin: bool = False,
+    must_change_password: bool = False,
 ) -> str:
     """建号。`credential_epoch` 从 1 起——0 与「没有版本」不可区分。
 
@@ -217,14 +220,18 @@ def insert_user(
     「不是平台所有者」；反过来默认 True 会让每一条建号路径（邀请建号、将来的
     批量导入）都悄悄多出一个能改全平台配置的人，而没有任何地方会报错。
     今天只有 `service.bootstrap` 传 True，且它只允许在空库上跑一次。
+
+    `must_change_password` 同样默认 False：邀请建号的人自己设了口令，不该被
+    再要求改一次；只有引导/管理员重置这条路径显式置 True。
     """
     user_id = new_id("u")
     moment = stamp(now)
     conn.execute(
         "insert into users"
         " (id, tenant_id, email, password_hash, role, status, credential_epoch,"
-        "  lockout_until, failed_attempts, is_platform_admin, created_at, updated_at)"
-        " values (?, ?, ?, ?, ?, 'active', 1, null, 0, ?, ?, ?)",
+        "  lockout_until, failed_attempts, is_platform_admin, must_change_password,"
+        "  created_at, updated_at)"
+        " values (?, ?, ?, ?, ?, 'active', 1, null, 0, ?, ?, ?, ?)",
         (
             user_id,
             tenant_id,
@@ -232,6 +239,7 @@ def insert_user(
             password_hash,
             str(role),
             1 if is_platform_admin else 0,
+            1 if must_change_password else 0,
             moment,
             moment,
         ),
@@ -246,7 +254,8 @@ def get_user(conn: sqlite3.Connection, user_id: str) -> Account | None:
     """
     row = conn.execute(
         "select id, tenant_id, email, role, status, credential_epoch,"
-        " lockout_until, failed_attempts, is_platform_admin from users where id = ?",
+        " lockout_until, failed_attempts, is_platform_admin, must_change_password"
+        " from users where id = ?",
         (user_id,),
     ).fetchone()
     return None if row is None else _account(row)
@@ -256,7 +265,7 @@ def get_user_by_email(conn: sqlite3.Connection, email: str) -> Account | None:
     """登录用。邮箱全局唯一（见 `ux_users_email`），所以这里不需要团队上下文。"""
     row = conn.execute(
         "select id, tenant_id, email, role, status, credential_epoch,"
-        " lockout_until, failed_attempts, is_platform_admin from users"
+        " lockout_until, failed_attempts, is_platform_admin, must_change_password from users"
         " where email = ? collate nocase",
         (_normalize_email(email),),
     ).fetchone()
@@ -267,7 +276,7 @@ def list_users(conn: sqlite3.Connection, tenant_id: str) -> list[Account]:
     """成员列表。团队条件在 SQL 里，不做 Python 过滤。"""
     rows = conn.execute(
         "select id, tenant_id, email, role, status, credential_epoch,"
-        " lockout_until, failed_attempts, is_platform_admin from users"
+        " lockout_until, failed_attempts, is_platform_admin, must_change_password from users"
         " where tenant_id = ? order by created_at, id",
         (tenant_id,),
     ).fetchall()
@@ -292,6 +301,22 @@ def set_password_hash(
         "update users set password_hash = ?, updated_at = ? where id = ?",
         (password_hash, stamp(now), user_id),
     )
+
+
+def set_must_change_password(
+    conn: sqlite3.Connection, user_id: str, *, required: bool, now: datetime
+) -> bool:
+    """设置/清除「首次登录必须改密」。返回是否真的改到了行。
+
+    它和 `credential_epoch` 是两件事：版本号负责让旧票据失效，这一列负责
+    告诉请求侧“业务面还没开”。混成一个值时，管理员重置会把版本号加一，
+    于是“还没改初始口令”这个事实被无关字段顺手抹掉。
+    """
+    cursor = conn.execute(
+        "update users set must_change_password = ?, updated_at = ? where id = ?",
+        (1 if required else 0, stamp(now), user_id),
+    )
+    return cursor.rowcount == 1
 
 
 def set_status(
@@ -518,6 +543,23 @@ def accept_invite(
     cursor = conn.execute(
         "update invites set accepted_at = ?, accepted_by = ? where id = ? and accepted_at is null",
         (stamp(now), accepted_by, invite_id),
+    )
+    return cursor.rowcount == 1
+
+
+def burn_invite(conn: sqlite3.Connection, invite_id: str, *, now: datetime) -> bool:
+    """作废一张邀请：**没人用它建号，但也不能再用**。
+
+    唯一的调用点是「接受时邮箱已被注册」。为什么必须烧掉而不是放着：不烧的话
+    `400 已注册` 这条失败路径**不消耗令牌**，于是一张邀请可以无限次问
+    「这个邮箱注册过吗」——红队把它当全局邮箱枚举器用（D9 R-03）。
+
+    `accepted_by` 留空是刻意的：这张邀请没有任何人接受过，把它记成某人接受过
+    会让审计回答一个错误的问题。烧掉的动作仍然原子（`accepted_at is null`）。
+    """
+    cursor = conn.execute(
+        "update invites set accepted_at = ? where id = ? and accepted_at is null",
+        (stamp(now), invite_id),
     )
     return cursor.rowcount == 1
 

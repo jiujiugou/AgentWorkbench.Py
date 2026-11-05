@@ -403,6 +403,19 @@ tests = [
 remaining = "内存的已知限制：openpyxl 合并信息只在非 read_only 模式可用，普通模式解析全量进内存；十万行约几百 MB 可接受，百万行是重开条件（read_only + 自行解析 mergeCells），写在 `office.py` 注释"
 evidence = "2026-11-04。上限防的是「一个 sheet 把解析进程拖垮、连带同进程其它文档一起失败」。截断在正文里说出来——静默截断会让用户以为整张表都在，而答案是按前 2000 行给的。改坏两组：去上限 → 行5 出现；截断不标注 → 「截断」断言红。max_rows 口径是**物理行含表头**，测试里注释写明"
 
+[[tool.agentworkbench.verification]]
+id = "V-19"
+req = "REQ-10"
+claim = "删除只对团队管理员开放：成员 403 且行仍在；成员拿别人的 id 与随机 id 得到逐字段相同的响应；管理员仍能删"
+negative = "去掉管理员判定（退回只判团队）→ 成员那条必须红；把判定挪到删除之后 → 「403 之后行已没了」那条必须红；只断言拒绝、不断言管理员能删 → 空实现（谁都不能删）也能过，所以第三条是正控"
+status = "pass"
+tests = [
+    "tests/invariants/test_document_delete_authorization.py::test_a_member_cannot_delete_a_document",
+    "tests/invariants/test_document_delete_authorization.py::test_a_member_gets_the_same_answer_for_a_missing_id",
+    "tests/invariants/test_document_delete_authorization.py::test_an_admin_can_still_delete",
+]
+evidence = "2026-11-05（D9-B R-03 → ADR 0008）。判定放在查行之前：403 与 404 的差别不然就是「这个 id 在不在」的探针。改坏：注释掉 require_admin → 成员两条红、管理员那条绿（它本来就是正控）。前端按 role 藏按钮只是礼貌，边界在后端"
+
 # ─────────────────────────────────────────────────────────────
 # F3 验证登记表（F3-功能验证 §4.2 的 G1~G15，机器可读版）
 # ─────────────────────────────────────────────────────────────
@@ -536,6 +549,7 @@ id = "G8"
 req = "REQ-08"
 claim = "二级校验：同主题邻块 gap ≥ 0.20 分得开"
 negative = "同主题误挂（号码对、内容不对）必须被抓——C# 实测不通过：0.091 / 0.125 / 0.000"
+evidence = "2026-11-05（D8）在 28 题真实语料上量过覆盖率分布：33 条引用中位 0.70、最低 0.368，而最低那几条（B02/B03/A05）都是**答对了**的题。也就是说词面覆盖率卡 0.5 会把正确答案判成无出处，卡 0.35 则一条都拦不住——**二级校验的判据不能是词面重叠**，`coverage_threshold` 因此保持 None（只记数不判），这是测过之后的决定，不是遗漏。要堵相邻领域硬答（D03 那次模型给带引用的编造答案），得换成句子与片段的事实级一致性判断"
 status = "partial"
 tests = [
     "tests/invariants/test_judgment_invariants.py::test_citation_second_check_has_no_maybe_verified",
@@ -602,7 +616,7 @@ req = "REQ-09"
 claim = "拒答卡与普通消息长得不一样，不显示来源列表与句级摘要"
 negative = "把拒答改回普通消息样式，必须一眼看出（人工，附失效条件）"
 status = "manual"
-evidence = "C# 人工通过。前端 web/ 已拷入待接 SSE；验证只能等界面接上做人工目视"
+evidence = "2026-11-05（D7）用真浏览器验到：拒答卡有独立样式（`.refusal-card` +「依据不足」+ code），**且不挂来源面板**（`scripts/ui_acceptance.py` 第 11 条，截图 `reports/acceptance/2026-11-05/ui/20261105-094426/shots/10-refusal.png`）。构造方式说明见 `reports/acceptance/2026-11-05/d7-ui.md` §4：默认 HashEmbedder 下单块必答、多块必拒，所以用「空库」拿到确定的拒答形态；真实模型下的拒答标定归 D8（P1-2）。**仍未验**：SSE 逐字流下的拒答（当前 Python 后端是一次请求-响应，没有流）；人眼观感留手工项 M1"
 
 [[tool.agentworkbench.verification]]
 id = "G12"
@@ -610,7 +624,7 @@ req = "REQ-08"
 claim = "无出处句底纹 + 引用卡片四字段（文件名/序号/页码/原文片段）"
 negative = "删掉虚线类名、裁掉任一字段，必须看得出（人工，附失效条件）"
 status = "manual"
-evidence = "C# 人工通过。回原文退到片段卡片不做页面跳转（D-06，页码精度撑不起跳转）"
+evidence = "2026-11-05（D7）真浏览器验到悬停卡片含四字段的**三样**：《文件名》+ 片段序号 + 原文片段（`07-citation-card.png`；页码只在有页数时出现，docx 无页码），「引用来源」面板可展开列片段（`08-sources-panel.png`）。脚本断言「卡片里必须出现文件名与片段原文」。**仍未验**：无出处句底纹（`.sent-uncited`）的视觉强度，与卡片遮挡正文的观感——留手工项 M1"
 
 [[tool.agentworkbench.verification]]
 id = "G13"
@@ -638,7 +652,7 @@ req = "REQ-09"
 claim = "启动期校验：每个判定阈值有消费者且非空，缺则进程起不来"
 negative = "带着空阈值启动必须失败——「未判定」是函数层语义，不是配置缺失的藏身处（C# SufficiencyGate 36 条测试全绿、阈值 null、拒答分支一次没走过）"
 status = "partial"
-remaining = "待建。四条防空分支机制之一（另三条：探针用例三样齐断言、评测报四值分布、改坏法）。「它能报出自己执行过几次」比「它测过几次」重要"
+remaining = "待建（空阈值仍能启动）。四条防空分支机制里，「评测报四值分布」已由 D8 落地：28 题跑出 answered 14 / insufficient 14 / weak 0 / undetermined 0 的真实分布，见 reports/acceptance/2026-11-05/d8-quality.md。另三条（探针用例三样齐断言、空阈值启动失败、改坏法）仍未做。「它能报出自己执行过几次」比「它测过几次」重要"
 
 # ─────────────────────────────────────────────────────────────
 # F4 验证登记表（F4-执行与审计 §4.2 / §4.3 的 V1~V11 + H1/H2，机器可读版）
@@ -853,7 +867,7 @@ invariant = "全"
 claim = "取一次真实 run 的模型名与 token，去供应商后台核，对得上"
 negative = "手动把 token 改大 10% → 核对必须发现不一致；发现不了说明这个人工资项没有判据"
 status = "manual"
-evidence = "未验。zhipu glm-4-flash 已真调通（1516 prompt tokens 进 prompt）。链路现在通了：client 原样保存供应商回的 usage，runner 落 run 与 assistant 步各一份 token。**只差真跑一轮**——ask 端点还没建，没有从接口触发一条真实 run 的路径。端点建好后跑一次，拿库里的 model + prompt_tokens 去智谱后台对账即可"
+evidence = "2026-11-05（D8）已跑出真实 run：28 道题走 /api/knowledge/ask，模型 glm-4-flash-250414（智谱），run 行里有 model 与两份 token。**只剩对账这一步需要人**：拿 D8 副本库里某条 run 的 prompt_tokens，去智谱后台同时间段的用量明细核一遍（改动 10% 能否被发现，本质上就是对账的严格度）。副本库：reports/acceptance/2026-11-05/d8/work/data/agentworkbench.db"
 
 [[tool.agentworkbench.verification]]
 id = "A-H2"
@@ -1238,6 +1252,7 @@ tests = [
     "tests/invariants/test_error_responses.py::test_response_header_matches_the_body_request_id",
     "tests/invariants/test_error_responses.py::test_unexpected_errors_also_carry_the_request_id",
     "tests/invariants/test_error_responses.py::test_two_requests_get_different_request_ids",
+    "tests/invariants/test_error_responses.py::test_validation_failures_use_the_same_envelope",
 ]
 evidence = "2026-11-03：五字段信封在 `api.errors.body_of` 统一；`RequestContextMiddleware`（纯 ASGI，不用 BaseHTTPMiddleware——它会干扰将来的 SSE）给每个请求生成 uuid4 的 request_id，写进 scope.state、响应头 `X-Request-Id`。http_status 进 body 是刻意的：curl -i 之外的调用方拿不到状态行原始值，两处必须同值。**实现时踩到 Starlette 的洋葱层**：兜底 500 由最外层的 ServerErrorMiddleware 生成，响应不流经用户中间件的 send——头在 handler 里自己设、中间件只补缺，否则 500 恰好是唯一没头的响应。404（AppError 路径）与 500（兜底路径）各验一次。改坏验证：摘掉中间件 → request_id 两条红；500 的头写死 → 头与 body 同值那条红"
 
@@ -1253,6 +1268,7 @@ tests = [
     "tests/invariants/test_error_responses.py::test_foreign_data_sentinel_reaches_logs_not_response",
     "tests/invariants/test_error_responses.py::test_internal_address_sentinel_reaches_logs_not_response",
     "tests/invariants/test_llm_client.py::test_client_errors_do_not_echo_the_exception",
+    "tests/invariants/test_error_responses.py::test_validation_failures_do_not_echo_the_rejected_value",
 ]
 evidence = "2026-11-03。注入点走真实路径：monkeypatch chat_factory 抛 RuntimeError（消息含哨兵），ask 路由的兜底让它变成 500——比造一条测试专用路由真实（专用路由过不了 declarations 闸门）。**写测试当场抓到一个现存泄露**：llm/client.py 的 MODEL_UNAVAILABLE 分支把上游异常原文 `{exc}` 拼进用户可见 message（base_url / api_key 都可能在那里）——已改为固定文案 + `logger.exception` 把原文留给日志。兜底 handler 也补了 `logger.exception`：判据前半句「日志里有」此前根本无处可查"
 
@@ -1399,7 +1415,7 @@ invariant = "稳"
 claim = "拿 request_id 在日志里还原一次失败：能看到 code、模型、耗时、上游状态；看不到凭据"
 negative = "日志里出现 api_key 明文 → 排障记录本身成了泄露源，红"
 status = "manual"
-evidence = "机制已建（2026-11-03）：request_id 进中间件 contextvars + 响应头，structlog 已在依赖。剩人工部分：真跑一次失败（不可达端点），拿 X-Request-Id 翻日志核对四样信息齐全、凭据不出现。自动化的哨兵测试（S-V5）守的是响应侧，日志侧的完整性只能人工核"
+evidence = "2026-11-03 建机制：request_id 进中间件 scope.state + 响应头；structlog 在依赖里但没有真正接上——D6 真跑时发现 503/404 一条日志都不写，按 request_id 根本查不到（已修：`api/app.py::on_app_error` 统一记 code/status/path/request_id/reason，5xx=warning、4xx=info，不记请求体）。**日志侧的「查得到」与「无凭据」现已自动化**（`test_every_failure_is_findable_by_request_id_in_the_logs` + `test_p0_secrets.py::test_a_real_failure_is_findable_by_request_id_in_the_logs`：真跑不可达端点，按 X-Request-Id 过滤日志，双向断言）。仍属人工的只剩 claim 里那两项细粒度：日志里的**模型名与耗时**——当前日志行不含它们，列入 D5 部署复核时再决定要不要补（补法是在 run 结束时记一条 summary，不在异常处理里拼）"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1824,6 +1840,32 @@ tests = [
 ]
 evidence = "2026-11-04。这条判据不是从表格里来的，是从一次实读来的：`settings` 六条端点只要求登录，而 `providers`/`provider_models`/`system_state` 三张表没有团队列。两步就能把全平台流量导走——`POST /api/settings/providers` 建一条指向自己的供应商，再 `/activate`：此后所有问答的提问原文与检索片段都经那台机器，答案也由它决定。修的不是「漏了一个 if」，是**权限被放在了错误的轴上**：`role` 回答「在我这个团队里能管谁」，而这三张表不属于任何团队，所以第二个团队出现的那天「A 队管理员改 B 队供应商」会是一条合法操作。落地：`users.is_platform_admin`（迁移 0006，`ALTER TABLE` 前先 `pragma table_info` 探列——新库建表时列已在，直接 ALTER 会 `duplicate column name` 而服务起不来）；这一列**不进 `ROLE_RANK`**；`insert_user` 默认 `False`（默认写 True 会让每一次邀请都悄悄多一个所有者）；全仓唯一写 1 的地方是 `service.bootstrap`，**没有任何接口能授予**（有授予入口则团队管理员自封，判据整体归零）；四条写入口挂 `dependencies=[Depends(_platform_only)]`，读接口不动。两个测试发现：①「依赖先于 body 解析」这个说法只在**字段校验**意义上成立——畸形 JSON 在 `request.json()` 阶段就 422，比任何依赖都早，所以那条断言改成缺字段（`json={}`）而不是坏 JSON；②第一版「平台轴不参与等级」的测试是恒真式——它用 `role=member` 的 actor 走 `judge_management`，而第一条规则（`role is not ADMIN → 403`）在他身上就出局了，改坏等级判定也红不了。改成两个方向都断（能管供应商 ⟹ 不能管人，反之亦然），改坏验证才抓得住。改坏验证 9 组全红：依赖空转 / 按角色判 / 永远放行 / 建号默认所有者 / 引导不写所有者 / 平台标记顶替团队管理员 / 老库升级默认给成所有者 / 迁移不判列已存在 / 原因码用笼统的角色不足。"
 
+[[tool.agentworkbench.verification]]
+id = "I-V19"
+req = "REQ-AUTH-11"
+invariant = "界"
+claim = "空库引导出的平台管理员首次登录返回 mustChangePassword=true；改密前除 /api/auth/me、/api/auth/logout、/api/auth/password 外，业务接口一律 403 password_change_required；改密成功后同一 cookie 访问业务接口 200，且标记清 0；存量账号迁移后默认 0"
+negative = "把默认值写成 1（存量账号升级后全被误伤）/ 只在登录响应里放标记而全局闸门不判（直接调 API 可绕过）/ 改密后不清标记 / 管理员重置口令后不重新置 1 / 新口令与旧口令相同仍允许 → 对应断言必须红"
+status = "pass"
+tests = [
+    "tests/invariants/test_identity_service.py::test_bootstrap_marks_the_admin_for_password_rotation",
+    "tests/invariants/test_identity_service.py::test_change_password_clears_the_rotation_flag",
+    "tests/invariants/test_identity_service.py::test_reset_password_marks_the_account_for_rotation",
+    "tests/invariants/test_identity_service.py::test_change_password_refuses_reusing_the_same_password",
+    "tests/invariants/test_identity_endpoint.py::test_login_reports_must_change_password",
+    "tests/invariants/test_identity_endpoint.py::test_first_login_is_limited_to_me_logout_and_change_password",
+    "tests/invariants/test_identity_endpoint.py::test_changing_the_initial_password_unlocks_the_api",
+    "tests/invariants/test_global_gate.py::test_must_change_blocks_a_route_added_after_create_app",
+    "tests/invariants/test_global_gate.py::test_must_change_403_is_recorded_with_its_own_reason",
+    "tests/invariants/test_identity_store.py::test_must_change_password_is_explicit_and_defaults_to_false",
+    "tests/invariants/test_migrations.py::test_create_schema_adds_the_flag_to_an_unversioned_old_database",
+    "tests/acceptance/test_p0_auth_lifecycle.py::test_bootstrapped_admin_must_rotate_before_any_business_call",
+    "web/tests/auth.spec.ts::test_login_returns_must_change_flag",
+    "web/tests/auth.spec.ts::test_password_change_required_403_keeps_session_and_redirects",
+    "web/tests/auth.spec.ts::test_change_password_wrong_old_does_not_trigger_global_401",
+]
+evidence = "2026-11-05。`users.must_change_password` 默认 0；`service.bootstrap`（生产默认）与 `reset_password` 置 1，`change_password` 清 0。全局闸门在票据/账户判定之后、业务路由之前检查，允许清单只有 me / logout / password；403 带独立原因码并写入拒绝记录。迁移双轨：新库由 `IDENTITY_SCHEMA_SQL` 带列，没有 `alembic_version` 的老库由 `create_schema` 幂等补列，有版本表的库走 0007。存量账号默认 0，不误伤。改坏验证：默认写 1 / 闸门不判 / 改密不清 / 重置不置 / 新旧口令相同 → 对应断言红。"
+
 # ─────────────────────────────────────────────────────────────
 # 状态机登记表：每个状态机叫什么、状态集、真源在哪。
 # **合法迁移不在这里抄第二份**——两份迁移表必然漂移，而且漂移的表现是
@@ -1976,6 +2018,8 @@ dev = [
     "pre-commit==4.7.0",
     "deptry==0.25.1",
     "pip-audit==2.10.1",
+    "playwright==1.64.1",
+    "psutil==7.2.2",
 ]
 
 [tool.setuptools]
@@ -2007,6 +2051,7 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]              # 测试里 assert 是断言，不是安全风险
 "scripts/*" = ["S603", "S607", "T20"]  # CI 脚本本来就要调外部命令并打印
+"scripts/repro/*" = ["S101"]      # 复现脚本的 assert 是"环境不对就别往下跑"，不是安全风险
 "evals/*" = ["T20", "S603"]       # print 是 CLI 的输出方式；subprocess 只调本仓脚本、无 shell
 "evals/run_rag_eval_v2.py" = ["T20", "S608"]  # vendored 副本（与 self 原版只差题库路径），豁免随原件
 "src/agentworkbench/cli.py" = ["T20"]  # CLI 的启动横幅就该打在 stdout 上——uvicorn 自己也这么干
@@ -2151,6 +2196,11 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "--strict-markers --strict-config"
 asyncio_default_fixture_loop_scope = "function"
+# 临时目录的去处由 `tests/conftest.py::pytest_configure` 接管（每次运行一个唯一的
+# `reports/pytest-tmp/run-<纳秒>`）。这里不再配 retention：既然 basetemp 每次都是新的，
+# pytest 那套「收集 → 批量删除」根本不会触发，也就不会撞上开发机上的删除守卫。
+#
+# 代价是 `reports/pytest-tmp/` 每次全量跑留约 600MB（可丢弃，见 .gitignore 的 reports/）。
 markers = [
     "invariant: 一条不变量的验证——被改坏时必须变红",
     "slow: 单条超过 1 秒",
@@ -2172,6 +2222,10 @@ extend_exclude = [
 [tool.deptry.per_rule_ignores]
 # 自引用不是"传递依赖"问题：`agentworkbench.*` 就是本仓自己的包。
 DEP003 = ["agentworkbench"]
+# 两个同级模块：`scripts/redteam_env.py` 是起实例的夹具，`scripts/repro/_repro.py`
+# 是 repro 脚本的共用输出层。它们靠 `sys.path.insert` 导入，不是可发布的包——
+# 声明成依赖反而是错的（没有版本、没有分发）。
+DEP001 = ["redteam_env", "_repro"]
 # dev 工具是「跑的工具」，本来就不该被业务代码 import，不是未使用依赖。
 DEP002 = [
     "ruff",

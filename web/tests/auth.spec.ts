@@ -15,7 +15,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Router } from 'vue-router'
 
-import { cachedSignedIn, forgetSession, login, logout } from '@/api/auth'
+import { cachedSignedIn, changePassword, forgetSession, login, logout } from '@/api/auth'
 import { ApiError, handle, onUnauthorized } from '@/api/http'
 import { installSessionExpiry } from '@/session'
 
@@ -25,6 +25,7 @@ const USER = {
   role: 'admin',
   status: 'active',
   tenantId: 't1',
+  mustChangePassword: false,
 }
 
 function json(body: unknown, status = 200): Response {
@@ -90,6 +91,15 @@ describe('登录', () => {
 
     await expect(login('a@b.c', 'wrong')).rejects.toThrow('邮箱或口令不正确。')
   })
+
+  // 登录响应里的首登标记必须原样保留，LoginView 靠它决定进哪一页
+  it('test_login_returns_must_change_flag', async () => {
+    fetchMock.mockResolvedValueOnce(json({ ...USER, mustChangePassword: true }))
+
+    const user = await login('admin@example.com', 'correct horse')
+
+    expect(user.mustChangePassword).toBe(true)
+  })
 })
 
 describe('会话失效', () => {
@@ -146,6 +156,52 @@ describe('会话失效', () => {
 
     fetchMock.mockResolvedValueOnce(empty(401))
     expect(await cachedSignedIn()).toBe(false)
+  })
+})
+
+describe('首登改密', () => {
+  // 业务接口 403 password_change_required → 保留登录态，跳改密页
+  it('test_password_change_required_403_keeps_session_and_redirects', async () => {
+    const { router, push } = fakeRouter('chat', '/chat?c=1')
+    installSessionExpiry(router)
+
+    fetchMock.mockResolvedValueOnce(json({ ...USER, mustChangePassword: true }))
+    expect(await cachedSignedIn()).toBe(true)
+
+    fetchMock.mockResolvedValueOnce(
+      json(
+        {
+          code: 'password_change_required',
+          message: '首次登录后必须先修改初始口令。',
+          request_id: 'r1',
+        },
+        403,
+      ),
+    )
+    await expect(handle<unknown>(await fetchMock('/', {}))).rejects.toBeInstanceOf(ApiError)
+
+    expect(push).toHaveBeenCalledWith({
+      path: '/change-password',
+      query: { redirect: '/chat?c=1' },
+    })
+    // 不清登录态：改密页本身需要当前 cookie
+    const calls = fetchMock.mock.calls.length
+    expect(await cachedSignedIn()).toBe(true)
+    expect(fetchMock.mock.calls.length).toBe(calls)
+  })
+
+  // 改密时旧口令错也是 401，但它不是“会话过期”，不能触发全局跳登录页
+  it('test_change_password_wrong_old_does_not_trigger_global_401', async () => {
+    const onFail = vi.fn()
+    onUnauthorized(onFail)
+    fetchMock.mockResolvedValueOnce(
+      json({ code: 'invalid_credentials', message: '当前口令不正确。' }, 401),
+    )
+
+    await expect(changePassword('old', 'new password long enough')).rejects.toThrow(
+      '当前口令不正确。',
+    )
+    expect(onFail).not.toHaveBeenCalled()
   })
 })
 

@@ -29,10 +29,11 @@ class ErrorCode(StrEnum):
 
     INVALID_CREDENTIALS = "invalid_credentials"
     NOT_AUTHENTICATED = "not_authenticated"
-    # 403 只有一处会用到：按动作调管理接口且角色不够（F1 §1.6 第 4 步）。
-    # **按 id 取资源一律 404**——那是「这个 id 存不存在」的侧信道，
-    # 而动作本身是公开的，403 不泄露任何资源。
+    # 403 只用于「按动作调的接口」：角色不够（F1 §1.6 第 4 步），
+    # 或首次登录还没改初始口令（I-V19）。**按 id 取资源一律 404**——那是
+    # 「这个 id 存不存在」的侧信道，而动作本身是公开的，403 不泄露任何资源。
     FORBIDDEN = "forbidden"
+    PASSWORD_CHANGE_REQUIRED = "password_change_required"  # noqa: S105 —— 错误码，不是口令
     NOT_FOUND = "not_found"
     VALIDATION_FAILED = "validation_failed"
     MODEL_NOT_CONFIGURED = "model_not_configured"
@@ -58,6 +59,7 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     ErrorCode.INVALID_CREDENTIALS: ErrorSpec(http_status=401, retryable=False),
     ErrorCode.NOT_AUTHENTICATED: ErrorSpec(http_status=401, retryable=False),
     ErrorCode.FORBIDDEN: ErrorSpec(http_status=403, retryable=False),
+    ErrorCode.PASSWORD_CHANGE_REQUIRED: ErrorSpec(http_status=403, retryable=False),
     ErrorCode.NOT_FOUND: ErrorSpec(http_status=404, retryable=False),
     ErrorCode.VALIDATION_FAILED: ErrorSpec(http_status=400, retryable=False),
     ErrorCode.MODEL_NOT_CONFIGURED: ErrorSpec(http_status=503, retryable=False),

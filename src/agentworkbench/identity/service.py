@@ -52,6 +52,7 @@ __all__ = [
     "LoginRejected",
     "LoginResult",
     "LoginSucceeded",
+    "PasswordUnchanged",
     "accept_invite",
     "bootstrap",
     "change_password",
@@ -256,6 +257,15 @@ def logout(conn: sqlite3.Connection, *, ticket: str, now: datetime) -> bool:
 # ── 凭据变更 ──
 
 
+class PasswordUnchanged(ValueError):
+    """新口令与旧口令相同。
+
+    它不是“旧口令错”，所以不能返回 False（调用方会把它翻成 401，用户会以为
+    自己输错了旧口令）；也不是服务故障。执行“必须改密”时，这一步是判据本身：
+    原样提交等于没改。
+    """
+
+
 def change_password(
     conn: sqlite3.Connection,
     *,
@@ -283,6 +293,8 @@ def change_password(
     matched, _ = credentials.verify_password(old_password, hashed)
     if not matched or hashed is None:
         return False
+    if old_password == new_password:
+        raise PasswordUnchanged("新口令不能与当前口令相同")
 
     keep = store.get_ticket_by_hash(conn, credentials.hash_ticket(current_ticket))
     keep_id = keep.ticket_id if keep is not None and keep.user_id == user_id else None
@@ -290,6 +302,7 @@ def change_password(
 
     with conn:
         store.set_password_hash(conn, user_id, new_hash, now=now)
+        store.set_must_change_password(conn, user_id, required=False, now=now)
         epoch = store.bump_credential_epoch(conn, user_id, now=now)
         store.revoke_user_tickets(conn, user_id, now=now, keep_ticket_id=keep_id)
         if keep_id is not None and not store.refresh_ticket_epoch(conn, keep_id, epoch=epoch):
@@ -300,17 +313,28 @@ def change_password(
 
 
 def reset_password(
-    conn: sqlite3.Connection, *, user_id: str, new_password: str, now: datetime
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    new_password: str,
+    now: datetime,
+    must_change_password: bool = True,
 ) -> None:
     """管理员重置口令。**吊销全部票据，一张不留。**
 
     与本人改密的差别就在这一点：管理员重置的前提通常是「这个人进不去了」
     或「凭据可能已泄露」。前者没有「当前会话」可保留，后者保留哪一条都是在赌。
     用户重置后必须重新登录，这是重置的语义。
+
+    默认把“登录后必须改密”置 1：运维知道这个临时口令，用户不该长期沿用。
+    测试/红队夹具要模拟“已经轮换过”的账号时才传 False——那是显式的夹具动作，
+    不是生产默认。
     """
     new_hash = credentials.hash_password(new_password)
     with conn:
         store.set_password_hash(conn, user_id, new_hash, now=now)
+        # 重置后的口令同样是一次性的：运维知道它，用户必须在下次登录后换掉。
+        store.set_must_change_password(conn, user_id, required=must_change_password, now=now)
         store.bump_credential_epoch(conn, user_id, now=now)
         store.revoke_user_tickets(conn, user_id, now=now)
 
@@ -476,6 +500,16 @@ def accept_invite(
         raise InviteUnusable("邀请不属于这个邮箱")
 
     if store.get_user_by_email(conn, email) is not None:
+        # **先把这张邀请烧掉，再报错。** 不烧的话「已注册」这条失败路径不消耗令牌，
+        # 一张邀请就能无限次问「这个邮箱注册过吗」——D9 红队把它当跨团队的邮箱
+        # 枚举器用（`redteam-A.md` R-03 / `redteam-B.md` R-02）。烧掉之后
+        # 一张邀请最多买到一个答案，探测成本从「两次请求」变成「一张邀请」。
+        #
+        # 仍然泄漏的那一半写在这里：**令牌持有者这一次**依然知道该邮箱已注册。
+        # 这是全局唯一邮箱 + 允许凭邀请自建号这两条设计合起来的固有结果，
+        # 不是这一行能消掉的；要彻底消掉得让邮箱按团队唯一（登录方式随之改变）。
+        with conn:
+            store.burn_invite(conn, row.invite_id, now=now)
         raise EmailAlreadyTaken(email)
 
     password_hash = credentials.hash_password(password)
@@ -527,6 +561,7 @@ def bootstrap(
     password: str,
     tenant_name: str,
     now: datetime,
+    must_change_password: bool = True,
 ) -> BootstrapResult:
     """空库上建首个团队 + 首个管理员。**只能跑一次**。
 
@@ -556,5 +591,8 @@ def bootstrap(
             # 所以只能在这里落一次（REQ-AUTH-12）。
             # 任何接口都不能改这一列：有授予入口，团队管理员就能自封。
             is_platform_admin=True,
+            # 生产路径默认要求首登改密；测试/迁移若需要“已经轮换过”的账号，
+            # 显式传 False，而不是把生产默认值改成安全的一侧之外。
+            must_change_password=must_change_password,
         )
     return BootstrapResult(tenant_id=tenant_id, user_id=user_id)

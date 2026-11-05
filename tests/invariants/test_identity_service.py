@@ -69,7 +69,16 @@ def cfg() -> service.AuthConfig:
 
 
 def seed_admin(conn: sqlite3.Connection, *, email: str = "admin@example.com") -> str:
-    result = service.bootstrap(conn, email=email, password=PASSWORD, tenant_name="团队甲", now=NOW)
+    # 大多数用例测的是登录/改密/停用本身，不是首登改密；显式声明“这个管理员
+    # 已经轮换过初始口令”，免得不相关的用例被闸门挡住。
+    result = service.bootstrap(
+        conn,
+        email=email,
+        password=PASSWORD,
+        tenant_name="团队甲",
+        now=NOW,
+        must_change_password=False,
+    )
     return result.user_id
 
 
@@ -111,7 +120,97 @@ def test_bootstrap_creates_a_loginable_admin(
     assert logged.account.user_id == result.user_id
     assert logged.account.role is Role.ADMIN
     assert logged.account.tenant_id == result.tenant_id
+    assert logged.account.must_change_password is True
     assert access(conn, logged.ticket).outcome is Outcome.ALLOW
+
+
+def test_bootstrap_marks_the_admin_for_password_rotation(
+    conn: sqlite3.Connection, cfg: service.AuthConfig
+) -> None:
+    """引导出来的管理员仍能登录，但账户上带着“先改初始口令”的标记。
+
+    这条不是“引导成功”的重复：`bootstrap_creates_a_loginable_admin` 只证明
+    口令对；本用例证明**生产路径**（默认参数）会把标记置 1。默认值写成 False
+    时前者全绿，而首登强制改密整条链静默失效。
+    """
+    result = service.bootstrap(
+        conn, email="admin@example.com", password=PASSWORD, tenant_name="团队甲", now=NOW
+    )
+
+    account = store.get_user(conn, result.user_id)
+    assert account is not None
+    assert account.must_change_password is True
+
+    logged = service.login(conn, email="admin@example.com", password=PASSWORD, now=NOW, config=cfg)
+    assert isinstance(logged, service.LoginSucceeded)
+
+
+def test_change_password_clears_the_rotation_flag(
+    conn: sqlite3.Connection, cfg: service.AuthConfig
+) -> None:
+    """本人改密成功后标记必须清 0；只换哈希不清标记等于永远改不完。"""
+    result = service.bootstrap(
+        conn, email="admin@example.com", password=PASSWORD, tenant_name="团队甲", now=NOW
+    )
+    logged = service.login(conn, email="admin@example.com", password=PASSWORD, now=NOW, config=cfg)
+    assert isinstance(logged, service.LoginSucceeded)
+
+    changed = service.change_password(
+        conn,
+        user_id=result.user_id,
+        current_ticket=logged.ticket,
+        old_password=PASSWORD,
+        new_password=NEW_PASSWORD,
+        now=NOW,
+    )
+
+    assert changed is True
+    account = store.get_user(conn, result.user_id)
+    assert account is not None and account.must_change_password is False
+
+
+def test_reset_password_marks_the_account_for_rotation(
+    conn: sqlite3.Connection, cfg: service.AuthConfig
+) -> None:
+    """管理员重置是“已泄露/进不去”的处置，重置后的口令也只是一次性的。"""
+    user_id = seed_admin(conn)
+
+    service.reset_password(conn, user_id=user_id, new_password=NEW_PASSWORD, now=NOW)
+
+    account = store.get_user(conn, user_id)
+    assert account is not None and account.must_change_password is True
+    assert isinstance(
+        service.login(conn, email="admin@example.com", password=NEW_PASSWORD, now=NOW, config=cfg),
+        service.LoginSucceeded,
+    )
+
+
+def test_change_password_refuses_reusing_the_same_password(
+    conn: sqlite3.Connection, cfg: service.AuthConfig
+) -> None:
+    """新口令等于旧口令时不能清标记——否则“必须改密”可以靠原样提交绕过。"""
+    result = service.bootstrap(
+        conn, email="admin@example.com", password=PASSWORD, tenant_name="团队甲", now=NOW
+    )
+    logged = service.login(conn, email="admin@example.com", password=PASSWORD, now=NOW, config=cfg)
+    assert isinstance(logged, service.LoginSucceeded)
+    before = store.get_user(conn, result.user_id)
+    assert before is not None
+
+    with pytest.raises(service.PasswordUnchanged):
+        service.change_password(
+            conn,
+            user_id=result.user_id,
+            current_ticket=logged.ticket,
+            old_password=PASSWORD,
+            new_password=PASSWORD,
+            now=NOW,
+        )
+
+    after = store.get_user(conn, result.user_id)
+    assert after is not None
+    assert after.must_change_password is True
+    assert after.credential_epoch == before.credential_epoch
 
 
 def test_bootstrap_refuses_a_second_run_and_changes_nothing(conn: sqlite3.Connection) -> None:
@@ -151,6 +250,7 @@ def test_bootstrap_cli_exits_zero_and_leaves_a_working_account(
     assert code == 0
     connection = engine.connect(tmp_path / "agentworkbench.db")
     try:
+        account = store.get_user_by_email(connection, "admin@example.com")
         logged = service.login(
             connection,
             email="admin@example.com",
@@ -160,6 +260,7 @@ def test_bootstrap_cli_exits_zero_and_leaves_a_working_account(
         )
     finally:
         connection.close()
+    assert account is not None and account.must_change_password is True
     assert isinstance(logged, service.LoginSucceeded)
 
 
@@ -449,6 +550,8 @@ def test_admin_reset_kills_every_session_including_the_asking_one(
 
     assert access(conn, first.ticket).outcome is Outcome.UNAUTHENTICATED
     assert access(conn, second.ticket).outcome is Outcome.UNAUTHENTICATED
+    account = store.get_user(conn, user_id)
+    assert account is not None and account.must_change_password is True
     assert isinstance(
         service.login(conn, email="admin@example.com", password=NEW_PASSWORD, now=NOW, config=cfg),
         service.LoginSucceeded,

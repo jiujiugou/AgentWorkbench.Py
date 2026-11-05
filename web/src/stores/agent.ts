@@ -54,6 +54,12 @@ export const useAgentStore = defineStore('agent', () => {
   /** 中止时的终态（cancelled / timeout / failed）；取消路径没有 run 摘要，靠它标状态。 */
   const stops = ref<Record<string, string>>({})
   const loadingConversation = ref(false)
+  /**
+   * 新建对话弹窗带过来的第一句。**只在这里过一手，不在弹窗里直接发**：
+   * 发送要落在 ChatView（它管滚动、自动增高、generating 态），弹窗只管收集意图。
+   * ChatView 读走之后必须清空——不清的话，从别的页面回到对话页会再发一次。
+   */
+  const pendingQuestion = ref('')
 
   const providers = ref<Provider[]>([])
   const selectedModelId = ref<number | null>(null)
@@ -544,6 +550,7 @@ export const useAgentStore = defineStore('agent', () => {
     // 会话
     conversations,
     loadingConversation,
+    pendingQuestion,
     titleFor,
     refreshConversations,
     selectConversation,

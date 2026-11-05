@@ -72,9 +72,12 @@ def _admin(request: Request, conn: sqlite3.Connection) -> Principal:
     再查目标（404），最后判目标本身（403）。反过来写，非管理员拿一串 id
     打管理接口，404 与 403 的差别就成了「这个人在不在」的探针——
     而这一步不需要任何权限就能试。
+
+    实现在 `identity_context.require_admin`：删除文档（ADR 0008）用的是同一条
+    规则，两份实现迟早分岔，而分岔的那一次不会报错。
     """
-    principal = identity_context.current_principal(request)
-    return identity_context.principal_of(policy.judge_admin(actor=principal))
+    del conn  # 保留参数是为了不改三处调用点；判定不需要连接
+    return identity_context.require_admin(request)
 
 
 def _target(conn: sqlite3.Connection, principal: Principal, user_id: str) -> Account:
@@ -176,6 +179,8 @@ def change_role(user_id: str, body: ChangeRoleBody, request: Request) -> UserDto
         updated = store.get_user(conn, target.user_id)
     if updated is None:  # pragma: no cover —— 同一事务里刚写过的行
         raise not_found(_MEMBER_MISSING)
+    # 降职/升职必须立刻体现在下一次判定上：缓存里那份 `Principal` 还带着旧角色。
+    deps.session_cache.forget_user(target.user_id)
     return _dto(updated)
 
 
@@ -197,6 +202,9 @@ def disable_member(user_id: str, request: Request) -> None:
         )
         if not service.disable_user(conn, user_id=target.user_id, now=datetime.now(UTC)):
             raise AppError(ErrorCode.VALIDATION_FAILED, "这个成员已经是停用状态。")
+    # 停用的意义是「立刻踢下线」。库里的票已全吊销，缓存不清就还得等一个窗口——
+    # 而那个窗口里他仍是管理员，还能改别人的角色（D9 红队实测：改动是永久的）。
+    deps.session_cache.forget_user(target.user_id)
 
 
 @router.post("/api/members/{user_id}/enable", status_code=204)
@@ -213,3 +221,5 @@ def enable_member(user_id: str, request: Request) -> None:
         )
         if not service.enable_user(conn, user_id=target.user_id, now=datetime.now(UTC)):
             raise AppError(ErrorCode.VALIDATION_FAILED, "这个成员当前不是停用状态。")
+    # 恢复同理：缓存里若有他停用前的身份，状态字段会与库不一致。
+    deps.session_cache.forget_user(target.user_id)
