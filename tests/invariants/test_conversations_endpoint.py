@@ -209,7 +209,8 @@ def test_list_is_a_bare_camel_case_array(h: Harness) -> None:
     body = h.client.get("/api/conversations").json()
 
     assert isinstance(body, list) and len(body) == 1
-    assert set(body[0]) == {"id", "title", "createdAt", "updatedAt"}
+    assert set(body[0]) == {"id", "title", "kind", "createdAt", "updatedAt"}
+    assert body[0]["kind"] == "knowledge"
     assert body[0]["title"] == ALARM[:18]
 
 
@@ -296,7 +297,11 @@ def test_a_conversation_without_messages_is_empty_not_missing(h: Harness) -> Non
     response = h.client.get("/api/conversations/empty-one/messages")
 
     assert response.status_code == 200
-    assert response.json() == {"conversationId": "empty-one", "messages": []}
+    assert response.json() == {
+        "conversationId": "empty-one",
+        "kind": "knowledge",
+        "messages": [],
+    }
 
 
 # ── 404 与越权 ──

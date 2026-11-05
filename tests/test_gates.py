@@ -312,6 +312,9 @@ REQUIRED_VERIFICATION_IDS = (
     # I-V19（2026-11-05）是首个管理员的首登改密：引导口令不能长期有效。
     | {f"I-V{n}" for n in range(1, 20)}
     | {f"I-H{n}" for n in range(1, 6)}  # F1 人工项（空库部署 / 文案 / 运维能答 / 界面 / 隔离）
+    # F7：通用对话。`D-` = Dialogue。F7 只写功能，判据登记在这里；
+    # 当前实现未开始，五条全部是 partial，不能提前写成 pass。
+    | {f"D-V{n}" for n in range(1, 6)}
 )
 VERIFICATION_STATUSES = {"pass", "partial", "fail", "manual"}
 # F4 §1.3 的四条不变量。抄在这里是当尺子用（同 REQUIRED_VERIFICATION_IDS 抄文档编号）：
@@ -333,11 +336,16 @@ F6_INVARIANTS = {"通", "查", "离", "稳", "一"}
 # 为什么是五条不是四条：把"隔"和"属"合成一个词之后，"别人的会话读不到"与
 # "别人的文档搜不到"会互相遮住覆盖度——一条绿了，另一条可以是空的。
 F1_INVARIANTS = {"认", "隔", "属", "记", "界"}
+# F7 的五条：不查（不检索文档）/ 明示（明确标注未使用企业资料）/
+# 不混（kind 不可变、不互相续聊）/ 不兜（知识库拒答不自动转通用）/
+# 留痕（每次通用回答都写 run，且不伪造检索步骤）。
+F7_INVARIANTS = {"不查", "明示", "不混", "不兜", "留痕"}
 INVARIANTS_BY_PREFIX: dict[str, set[str]] = {
     "A-": F4_INVARIANTS,
     "C-": F5_INVARIANTS,
     "S-": F6_INVARIANTS,
     "I-": F1_INVARIANTS,
+    "D-": F7_INVARIANTS,
 }
 
 
@@ -345,9 +353,10 @@ def test_verification_table_matches_tests() -> None:
     """验证登记表与测试文件必须互相证成——「说验过但测试没了」的唯一防线。
 
     四条规则：
-    ① F2 的 V-1~V-18、F3 的 G1~G15、F4 的 A-V1~A-V11（含 V1b）与 A-H1/H2、
-       F5 的 C-V1~C-V13 与 C-H1/H2、F6 的 S-V1~S-V10 与 S-H1/H2、
-       F1 的 I-V1~I-V16 与 I-H1~H5 一条不能少——少一条等于漏验，而且是不留痕迹的漏验。
+    ① F2 的 V-1~V-19、F3 的 G1~G15、F4 的 A-V1~A-V11（含 V1b）与 A-H1/H2、
+       F5 的 C-V1~C-V13 与 C-H1/H2、F6 的 S-V1~S-V12 与 S-H1/H2、
+       F7 的 D-V1~D-V5、F1 的 I-V1~I-V19 与 I-H1~H5 一条不能少——
+       少一条等于漏验，而且是不留痕迹的漏验。
        G1/V-10、G2/V-11、A-V3/V3 是同一验证对象在不同域文档里的编号，
        两边都强制登记，删哪边都红。
     ② status=pass 的条目，tests 列的每个 `文件::函数` 必须真实存在：

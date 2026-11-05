@@ -33,7 +33,7 @@ import sqlite3
 from collections.abc import Sequence
 from typing import cast
 
-from agentworkbench.core.conversation import CitationSnapshot, MessageRole
+from agentworkbench.core.conversation import CitationSnapshot, ConversationKind, MessageRole
 from agentworkbench.core.identity import Owner
 
 
@@ -44,15 +44,17 @@ def create(
     conversation_id: str,
     title: str,
     now: str,
+    kind: ConversationKind = ConversationKind.KNOWLEDGE,
 ) -> None:
     """建一条会话。`title` 由调用方派生（`core.conversation.derive_title`），
 
     这里不派生：仓储不该知道"18 字"这条规则，否则改标题规则要改两处。
+    `kind` 默认 knowledge 只为兼容旧调用方；新的通用入口必须显式传 GENERAL。
     """
     conn.execute(
-        "insert into conversations(id, user_id, tenant_id, title, created_at, updated_at)"
-        " values (?,?,?,?,?,?)",
-        (conversation_id, owner.user_id, owner.tenant_id, title, now, now),
+        "insert into conversations(id, user_id, tenant_id, kind, title, created_at, updated_at)"
+        " values (?,?,?,?,?,?,?)",
+        (conversation_id, owner.user_id, owner.tenant_id, kind.value, title, now, now),
     )
 
 
@@ -74,21 +76,28 @@ def get(conn: sqlite3.Connection, owner: Owner, conversation_id: str) -> sqlite3
 
 
 def list_for_owner(
-    conn: sqlite3.Connection, owner: Owner, *, limit: int = 50, offset: int = 0
+    conn: sqlite3.Connection,
+    owner: Owner,
+    *,
+    kind: ConversationKind | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> list[sqlite3.Row]:
     """列表。过滤与排序都在 SQL 里，索引 `ix_conversations_owner_updated` 直接命中。
 
     `id` 进排序键不是洁癖：`updated_at` 只到秒，同一秒建的两条靠时间排会换位，
     而"换设备一模一样"落到测试里就变成随机红——随机红最后一定被人用 `-x` 跳过。
+
+    `kind` 过滤是可选的：不传时两类会话混排，每条都带自己的 kind；传了才缩小。
     """
-    return cast(
-        list[sqlite3.Row],
-        conn.execute(
-            "select * from conversations where tenant_id = ? and user_id = ?"
-            " order by updated_at desc, id desc limit ? offset ?",
-            (owner.tenant_id, owner.user_id, limit, offset),
-        ).fetchall(),
-    )
+    sql = "select * from conversations where tenant_id = ? and user_id = ?"
+    params: list[object] = [owner.tenant_id, owner.user_id]
+    if kind is not None:
+        sql += " and kind = ?"
+        params.append(kind.value)
+    sql += " order by updated_at desc, id desc limit ? offset ?"
+    params.extend((limit, offset))
+    return cast(list[sqlite3.Row], conn.execute(sql, params).fetchall())
 
 
 def count_for_owner(conn: sqlite3.Connection, owner: Owner) -> int:
@@ -303,7 +312,8 @@ def list_messages(
     return cast(
         list[sqlite3.Row],
         conn.execute(
-            "select m.*, r.status as run_status, r.reason as run_reason"
+            "select m.*, c.kind as conversation_kind,"
+            " r.status as run_status, r.reason as run_reason"
             " from messages m"
             " join conversations c on c.id = m.conversation_id"
             " left join agent_runs r on r.id = m.run_id"

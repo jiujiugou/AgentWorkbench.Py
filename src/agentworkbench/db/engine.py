@@ -18,7 +18,7 @@ from pathlib import Path
 
 import sqlite_vec  # type: ignore[import-untyped]
 
-from agentworkbench.core.conversation import MessageRole
+from agentworkbench.core.conversation import ConversationKind, MessageRole
 from agentworkbench.core.judgment import CitationFirstCheck, CitationSecondCheck
 from agentworkbench.core.runs import RunStatus, StepKind
 from agentworkbench.core.vectors import EMBEDDING_DIM
@@ -30,6 +30,7 @@ _STEP_KIND_VALUES = ", ".join(f"'{kind.value}'" for kind in StepKind)
 # 同一个理由：role 与两级校验的取值也来自 core。校验结论**必须原样存档**，
 # 所以它的取值集要能和现在的枚举对上——重开后界面靠它显示「当时标红的误挂」
 _ROLE_VALUES = ", ".join(f"'{role.value}'" for role in MessageRole)
+_CONVERSATION_KIND_VALUES = ", ".join(f"'{kind.value}'" for kind in ConversationKind)
 _FIRST_CHECK_VALUES = ", ".join(f"'{check.value}'" for check in CitationFirstCheck)
 _SECOND_CHECK_VALUES = ", ".join(f"'{check.value}'" for check in CitationSecondCheck)
 
@@ -94,6 +95,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     user_id    TEXT NOT NULL,
     tenant_id  TEXT NOT NULL,
+    -- 答案合同（F7 §3.1）：knowledge = 有证据才答；general = 不检索、不引用。
+    -- 默认 knowledge 只为兼容 F7 之前创建的会话；新建入口必须显式传 kind。
+    kind       TEXT NOT NULL DEFAULT 'knowledge'
+        CHECK (kind IN ({_CONVERSATION_KIND_VALUES})),
     -- 标题：首条用户消息前 18 字，写一次之后不再变（C-V9）。
     -- NOT NULL 而不是可空：可空会催生「没有标题时界面自己编一个」——
     -- 那正好是 C# 的形态（标题只活在前端内存，换设备全变「新会话」）
@@ -508,12 +513,41 @@ def ensure_must_change_password_column(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def ensure_conversation_kind_column(conn: sqlite3.Connection) -> bool:
+    """给已有的 `conversations` 补上 `kind` 并确保不可变触发器存在。
+
+    返回是否真的加过列。默认 `knowledge`：F7 之前的会话全部来自知识库问答，
+    升级后不能被误标成通用回答。加列与建触发器都幂等；启动期只做这种
+    向后兼容变更，真正的结构迁移仍走 Alembic。
+    """
+    columns = {str(row[1]) for row in conn.execute("pragma table_info(conversations)").fetchall()}
+    added = False
+    if "kind" not in columns:
+        try:
+            conn.execute(
+                "alter table conversations add column kind text not null default 'knowledge'"
+                f" check (kind in ({_CONVERSATION_KIND_VALUES}))"
+            )
+            added = True
+        except sqlite3.OperationalError as exc:
+            # 两个进程同时启动时另一个已经加过；其余错误（锁死 / 磁盘满）必须失败。
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.execute(
+        "create trigger if not exists trg_conversations_kind_immutable"
+        " before update of kind on conversations"
+        " begin select raise(abort, 'conversations.kind 创建后不可修改'); end"
+    )
+    return added
+
+
 def create_schema(conn: sqlite3.Connection) -> None:
     """建表。幂等，空库起服务时调一次。
 
-    对已存在的库，这里只补**向后兼容的列**（见 `ensure_must_change_password_column`），
-    不替代 Alembic 的结构迁移。
+    对已存在的库，这里只做**向后兼容的加列**（见 `ensure_must_change_password_column`
+    与 `ensure_conversation_kind_column`），不替代 Alembic 的结构迁移。
     """
     conn.executescript(SCHEMA_SQL)
     ensure_must_change_password_column(conn)
+    ensure_conversation_kind_column(conn)
     conn.commit()

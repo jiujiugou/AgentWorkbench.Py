@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine
@@ -56,6 +57,39 @@ def test_alembic_initial_matches_create_schema(tmp_path: Path) -> None:
 
     migrated.close()
     direct.close()
+
+
+def test_create_schema_adds_kind_to_an_unversioned_old_database(tmp_path: Path) -> None:
+    """F7 之前建的 conversations 没有 kind：启动期必须补成 knowledge 并上锁。
+
+    先有列还是先有触发器有顺序：老表没有 kind 时直接建
+    `BEFORE UPDATE OF kind` 触发器会报 no such column，启动就失败。
+    所以触发器只能在补列之后建——这条用例就是那个顺序的负控。
+    """
+    path = tmp_path / "legacy-conversations.db"
+    conn = engine.connect(path)
+    try:
+        conn.executescript(
+            "create table conversations ("
+            " id text primary key, user_id text not null, tenant_id text not null,"
+            " title text not null, created_at text not null, updated_at text not null);"
+            "insert into conversations"
+            " (id, user_id, tenant_id, title, created_at, updated_at)"
+            " values ('old-conv', 'local', 'default', '旧会话', 't', 't');"
+        )
+        conn.commit()
+
+        engine.create_schema(conn)
+        engine.create_schema(conn)  # 幂等：第二次不能 duplicate column / trigger
+
+        row = conn.execute("select kind from conversations where id = 'old-conv'").fetchone()
+        assert row is not None
+        assert row["kind"] == "knowledge"
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("update conversations set kind = 'general' where id = 'old-conv'")
+    finally:
+        conn.close()
 
 
 def test_create_schema_adds_the_flag_to_an_unversioned_old_database(tmp_path: Path) -> None:

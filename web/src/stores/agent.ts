@@ -4,11 +4,13 @@ import * as signalR from '@microsoft/signalr'
 import { ElMessage } from 'element-plus'
 import type { CitationReport, RefusalInfo, RetrievalSource, RunSummary, ToolStepEvent } from '@/types'
 import { askKnowledge, historyReport, historySources, toReport, toSources } from '@/api/knowledge'
+import { chatGeneral } from '@/api/chat'
 import {
   conversationsApi,
   toRunSummary,
   toToolSteps,
   type Conversation,
+  type ConversationKind,
 } from '@/api/conversations'
 import { settingsApi, type Provider } from '@/api/settings'
 
@@ -19,9 +21,11 @@ export interface ChatMessage {
   pending?: boolean
   /**
    * 历史消息带回来的那次运行终态。只读：它来自 `agent_runs`，不在前端重算。
-   * `running` + 空正文 = 那一轮没跑完（进程可能已中断），与"跑完但空"分开显示。
+   * `running` + 空正文 = 那一轮没跑完（进程可能已中断），与“跑完但空”分开显示。
    */
   runStatus?: string | null
+  /** 这条消息所属会话的答案合同。general 时界面必须标“未使用企业资料”。 */
+  mode?: ConversationKind
 }
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected'
@@ -96,13 +100,15 @@ export const useAgentStore = defineStore('agent', () => {
     }
     loadingConversation.value = true
     try {
-      const history = await conversationsApi.messages(id)
+      const thread = await conversationsApi.messages(id)
+      const history = thread.messages
       conversationId.value = id
       messages.value = history.map((m) => ({
         id: String(m.id),
         role: m.role,
         content: m.content,
         runStatus: m.runStatus,
+        mode: thread.kind,
       }))
 
       // 逐条恢复"答案 + 依据 + 过程"三块，而不是只恢复正文。
@@ -448,6 +454,7 @@ export const useAgentStore = defineStore('agent', () => {
   function applyResponse(messageId: string, response: Awaited<ReturnType<typeof askKnowledge>>): void {
     const message = findOrCreate(messageId)
     message.pending = false
+    message.mode = 'knowledge'
     message.content = response.answer
 
     if (response.status === 'refused') {
@@ -471,6 +478,27 @@ export const useAgentStore = defineStore('agent', () => {
     void loadTrace(messageId, response.runId)
   }
 
+  function applyGeneralResponse(
+    messageId: string,
+    response: Awaited<ReturnType<typeof chatGeneral>>,
+  ): void {
+    const message = findOrCreate(messageId)
+    message.pending = false
+    message.mode = 'general'
+    message.content = response.answer
+
+    // 通用回答没有来源、引用或拒答卡。主动清掉，避免切入口后继承上一条
+    // 知识库回答的卡片——清理是“这条回答没有依据”的结构表达，不靠 key
+    // 永远不重复。
+    delete sources.value[messageId]
+    delete citations.value[messageId]
+    delete refusals.value[messageId]
+
+    conversationId.value = response.conversationId
+    persistConversationId(response.conversationId)
+    void loadTrace(messageId, response.runId)
+  }
+
   async function dispatch(method: 'Send' | 'Ask', text: string): Promise<void> {
     const content = text.trim()
     if (!content || generating.value) return
@@ -481,11 +509,15 @@ export const useAgentStore = defineStore('agent', () => {
     generating.value = true
 
     try {
-      // Python 后端只有知识问答一条路（系统预检索），没有通用对话——
-      // `Send` 与 `Ask` 在这里行为相同。等 F5 的会话能力接上再分叉。
-      void method
-      const response = await askKnowledge(content, conversationId.value)
-      applyResponse(replyId, response)
+      if (method === 'Ask') {
+        // 知识库入口：有检索、引用与拒答。
+        const response = await askKnowledge(content, conversationId.value)
+        applyResponse(replyId, response)
+      } else {
+        // 通用入口：不检索、不引用，响应明确标识 mode=general。
+        const response = await chatGeneral(content, conversationId.value)
+        applyGeneralResponse(replyId, response)
+      }
       // 新建的会话要出现在侧栏。不刷新的话它只在下次进页面时才出现，
       // 用户会以为"刚才那次对话没保存"（而实际上已经落库了）。
       await refreshConversations()

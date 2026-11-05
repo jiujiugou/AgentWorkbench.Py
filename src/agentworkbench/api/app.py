@@ -28,7 +28,17 @@ from agentworkbench.api import errors, refusals
 from agentworkbench.api.deps import Deps, build_deps
 from agentworkbench.api.identity_context import require_session
 from agentworkbench.api.request_context import RequestContextMiddleware
-from agentworkbench.api.routes import conversations, documents, identity, knowledge, members, runs
+from agentworkbench.api.routes import (
+    chat as chat_api,
+)
+from agentworkbench.api.routes import (
+    conversations,
+    documents,
+    identity,
+    knowledge,
+    members,
+    runs,
+)
 
 # `settings` 与 create_app 的参数同名，导入时起别名——不遮蔽，遮蔽的报错是
 # `'NoneType' object has no attribute 'router'`，与真实成因（名字被参数盖住）相去甚远。
@@ -263,6 +273,7 @@ def create_app(
 
     app.include_router(documents.router)
     app.include_router(knowledge.router)
+    app.include_router(chat_api.router)
     app.include_router(conversations.router)
     app.include_router(settings_api.router)
     app.include_router(runs.router)

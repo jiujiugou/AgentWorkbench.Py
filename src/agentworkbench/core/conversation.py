@@ -29,6 +29,18 @@ class MessageRole(StrEnum):
     ASSISTANT = "assistant"
 
 
+class ConversationKind(StrEnum):
+    """一条会话属于哪种答案合同（F7 §3.1）。
+
+    创建时二选一，之后不可改；切换模式必须新建会话。这个枚举是 SQL CHECK
+    与仓储、DTO 的唯一取值来源——在别处抄字符串，第三种类型出现时就会有
+    一条路径悄悄放行。
+    """
+
+    KNOWLEDGE = "knowledge"
+    GENERAL = "general"
+
+
 TITLE_MAX_CHARS = 18
 """标题长度。写在这里而不是散在调用点：它是**判据的一部分**（换设备后标题必须相同），
 不是装饰性的截断。18 与前端现有显示宽度对齐——两边取不同的数，同一个会话

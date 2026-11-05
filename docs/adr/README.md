@@ -85,3 +85,4 @@ ADR 与设计文档会写同一件事——这是**有意的**，但必须指定
 | [0007](0007-file-before-record.md) | 上传先落盘、后写记录，文件一律覆盖写 | Accepted | F2 |
 | [0008](0008-delete-is-admin-only.md) | 删除文档只对团队管理员开放 | Accepted | F2 |
 | [0009](0009-first-login-password-rotation.md) | 首个管理员首次登录必须改密 | Accepted | F1 |
+| [0010](0010-general-chat-is-a-separate-capability.md) | 通用对话与知识库问答分成两个能力 | Accepted | F7 |

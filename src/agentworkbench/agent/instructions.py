@@ -71,3 +71,32 @@ def build_user_prompt(question: str, evidence: tuple[NumberedHit, ...] | list[Nu
         for h in evidence
     )
     return USER_PROMPT_TEMPLATE.format(question=question, blocks=blocks)
+
+
+# ── F7 通用对话 ─────────────────────────────────────────────
+# 通用对话的合同与知识库问答不同：它允许模型凭通用知识回答，但不许声称
+# 答案来自企业资料，也不许产生引用角标。提示词只能“请求”模型不编造来源，
+# 真正的保证仍在结构上：这条链路不检索、不塞证据、落库不写引用快照。
+GENERAL_CHAT_SYSTEM = (
+    "你是通用对话助手。你可以使用自己的通用知识回答。\n"
+    "本次对话没有检索企业资料，回答中不得声称内容来自企业文档、知识库或内部资料。\n"
+    "不要使用 [1] 这类引用编号，也不要编造文件名、页码或原文。\n"
+    "如果不知道，就明确说不知道；不要为了显得确定而编造事实。\n"
+    "回答使用简洁的中文，除非用户要求其他语言。"
+)
+
+GENERAL_USER_TEMPLATE = "【对话历史】\n{history}\n\n【当前问题】\n{question}"
+
+GENERAL_PROMPT_VERSION = hashlib.sha256(
+    (GENERAL_CHAT_SYSTEM + "\x1f" + GENERAL_USER_TEMPLATE).encode("utf-8")
+).hexdigest()[:12]
+"""通用对话提示词版本。与 F3 的 PROMPT_VERSION 分开：两套合同各自变更。"""
+
+
+def build_general_user_prompt(history: str, question: str) -> str:
+    """把同一条 general 会话的历史与当前问题交给模型。
+
+    历史只来自同 kind 的会话（类型不匹配时 `start_turn` 已新建），所以这里
+    不会把知识库问答的引用历史混进通用回答。
+    """
+    return GENERAL_USER_TEMPLATE.format(history=history or "（无）", question=question)

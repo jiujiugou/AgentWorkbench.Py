@@ -17,14 +17,16 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Sequence
 from functools import partial
 from typing import cast
 
-from agentworkbench.agent import runner
+from agentworkbench.agent import general, runner
 from agentworkbench.agent.runner import AskResult
 from agentworkbench.api.deps import Deps, utc_now
 from agentworkbench.chat import conversation as chat_turn
 from agentworkbench.chat import messages as chat_writer
+from agentworkbench.core.conversation import ConversationKind
 from agentworkbench.core.identity import Owner
 from agentworkbench.llm.client import ChatClient
 from agentworkbench.trace.recorder import Recorder, RecordingFailed
@@ -40,6 +42,7 @@ def start_turn_or_503(
     *,
     question: str,
     conversation_id: str | None = None,
+    kind: ConversationKind = ConversationKind.KNOWLEDGE,
 ) -> chat_turn.StartedTurn:
     """开一轮：会话 + 用户消息，一个事务。库写不进去 → 503 `audit_unavailable`。
 
@@ -53,6 +56,7 @@ def start_turn_or_503(
             owner,
             question=question,
             conversation_id=conversation_id,
+            kind=kind,
             now=utc_now(),
         )
     except sqlite3.Error as exc:
@@ -102,6 +106,49 @@ def execute_turn(
         answer=result.answer,
         evidence=result.evidence,
         report=result.report,
+        now=utc_now(),
+    )
+    return result
+
+
+def execute_general_turn(
+    conn: sqlite3.Connection,
+    owner: Owner,
+    *,
+    question: str,
+    conversation_id: str,
+    history: Sequence[tuple[str, str]],
+    chat: object,
+    model_name: str,
+) -> general.GeneralResult:
+    """通用对话的 ③④ 两步：作答 + 落回答。
+
+    与知识问答共用 `Recorder` 与消息两段写，但不经过 `runner.ask`：那条链
+    第一步就是检索，通用对话没有这一步。失败仍由 `_save_failed_answer`
+    留一行空 assistant，保证这次 run 在历史里有挂点。
+    """
+    recorder = Recorder(conn, user_id=owner.user_id, tenant_id=owner.tenant_id)
+    try:
+        result = general.chat_general(
+            question,
+            history=history,
+            chat=cast("ChatClient", chat),
+            recorder=recorder,
+            model_name=model_name,
+            on_started=partial(_save_placeholder, conn, owner, conversation_id=conversation_id),
+        )
+    except Exception:
+        _save_failed_answer(conn, owner, conversation_id=conversation_id, recorder=recorder)
+        raise
+
+    chat_writer.complete_answer(
+        conn,
+        owner,
+        conversation_id=conversation_id,
+        run_id=result.run_id,
+        answer=result.answer,
+        evidence=None,
+        report=None,
         now=utc_now(),
     )
     return result

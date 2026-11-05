@@ -42,6 +42,10 @@ dependencies = [
 #      也就没有下文了——没有重开条件的拒绝，半年后没人敢动它）
 # planned 表示「批准了但还没接」，此时不许出现在 dependencies，也不许 import。
 #
+# F7 通用对话不新增第三方包：入口继续用 fastapi/pydantic，生成继续用 openai
+# （同一个平台级客户端），会话与 run 继续用 sqlite3 + trace.recorder。新增的是
+# 「入口与合同」，不是「又一套技术栈」——所以下面没有第二条 openai。
+#
 # ── 什么算「该用库」（2026-11-04 定，F1 讨论的结果）──
 # 判据只有一条：**这件事在行业里有没有标准形态。**
 #   有标准形态 → 用库。口令哈希、加密、迁移、HTTP 框架、解析器都属此类；
@@ -1866,6 +1870,65 @@ tests = [
 ]
 evidence = "2026-11-05。`users.must_change_password` 默认 0；`service.bootstrap`（生产默认）与 `reset_password` 置 1，`change_password` 清 0。全局闸门在票据/账户判定之后、业务路由之前检查，允许清单只有 me / logout / password；403 带独立原因码并写入拒绝记录。迁移双轨：新库由 `IDENTITY_SCHEMA_SQL` 带列，没有 `alembic_version` 的老库由 `create_schema` 幂等补列，有版本表的库走 0007。存量账号默认 0，不误伤。改坏验证：默认写 1 / 闸门不判 / 改密不清 / 重置不置 / 新旧口令相同 → 对应断言红。"
 
+[[tool.agentworkbench.verification]]
+id = "D-V1"
+req = "REQ-23"
+invariant = "不查"
+claim = "通用对话请求不检索企业文档：本次 run 没有检索/证据步骤，响应 sources/citations 为空，且不读取 chunks 作为回答依据"
+negative = "通用作答出现 retrieval step、引用角标或来源面板 → 不通过；用 knowledge 会话的检索结果拼出通用回答也算不查失败"
+status = "pass"
+tests = [
+    "tests/invariants/test_general_chat_contract.py::test_general_chat_does_not_retrieve",
+]
+
+[[tool.agentworkbench.verification]]
+id = "D-V2"
+req = "REQ-23"
+invariant = "明示"
+claim = "通用回答在接口与界面都明确标识 general / 未使用企业资料；不显示来源面板与引用角标；知识库回答不显示该标识"
+negative = "通用回答被渲染成知识库气泡，或通用回答出现引用卡 → 不通过；只在接口里放 mode 而界面看不出来也算失败"
+status = "pass"
+tests = [
+    "tests/invariants/test_general_chat_contract.py::test_general_chat_is_marked_as_general",
+    "web/tests/chat.spec.ts::test_general_answer_is_labelled_as_not_using_company_data",
+    "web/tests/chat.spec.ts::test_knowledge_answer_does_not_carry_the_general_label",
+]
+
+[[tool.agentworkbench.verification]]
+id = "D-V3"
+req = "REQ-23"
+invariant = "不混"
+claim = "conversations.kind 创建时固定为 knowledge 或 general；不同 kind 不互相续聊，列表可辨识/筛选，类型在刷新后不丢失"
+negative = "同一条会话的 kind 被 UPDATE；通用回答写进知识库会话；列表计数或筛选泄漏另一类会话是否存在 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_general_chat_contract.py::test_conversation_kind_is_immutable",
+]
+
+[[tool.agentworkbench.verification]]
+id = "D-V4"
+req = "REQ-23"
+invariant = "不兜"
+claim = "知识库问答判定资料不足后停留在拒答；不会自动调用通用入口生成回答，用户要通用回答必须自己切换入口"
+negative = "知识库拒答后自动出现通用答案，或前端把拒答文案替换成通用回答 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_general_chat_contract.py::test_refusal_does_not_fall_back_to_general_chat",
+    "web/tests/general-chat.spec.ts::test_refusal_does_not_fall_back_to_general_chat",
+]
+
+[[tool.agentworkbench.verification]]
+id = "D-V5"
+req = "REQ-23"
+invariant = "留痕"
+claim = "每次通用作答恰好产生一条 run，user_id/tenant_id 正确，assistant 行有 run_id；run 没有检索/证据步骤且不得伪造"
+negative = "通用回答没有 run；run 里出现伪造的 retrieval/evidence 步骤；归属为他人或默认团队 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_general_chat_contract.py::test_general_chat_writes_one_run_without_retrieval_steps",
+    "tests/acceptance/test_p0_audit_entries.py::test_every_producing_route_writes_exactly_one_run",
+]
+
 # ─────────────────────────────────────────────────────────────
 # 状态机登记表：每个状态机叫什么、状态集、真源在哪。
 # **合法迁移不在这里抄第二份**——两份迁移表必然漂移，而且漂移的表现是
@@ -1907,6 +1970,13 @@ owner = "F1"
 states = "pending, accepted, expired"
 source = "agentworkbench.identity.policy"
 note = "一次性。accepted 与建号同一事务（否则并发两次都能建）；expired 同样是时间比较。用过的邀请第二次访问返回 404，与「不存在的邀请」逐字段相同——邀请 id 也是探针。"
+
+[[tool.agentworkbench.state_machine]]
+name = "conversation_kind"
+owner = "F7"
+states = "general, knowledge"
+source = "agentworkbench.db.repositories.conversations"
+note = "不是可迁移状态机，是创建时二选一的类型状态集：合法迁移为空集，切换模式必须新建会话。登记在这里是为了让第三种会话类型出现时必须经过闸门审查，而不是悄悄加一个分支。"
 
 [[tool.agentworkbench.component]]
 capability = "切块"
@@ -1960,7 +2030,7 @@ capability = "模型调用 SDK"
 package = "openai"
 modules = ["openai"]
 status = "adopted"
-reason = "F3 生成段已接入（2026-11-02）：与 C# ChatClientFactory 同构——base_url 覆盖指向任意 OpenAI 兼容端点，不区分厂商只认协议。供应商配置在库（providers/provider_models，C# 迁移的 zhipu/siliconflow 两家带密钥），激活端点 + 默认模型从库解析；未配置报 MODEL_NOT_CONFIGURED 不静默。core 层 forbidden_modules 仍含 openai（core 不许碰模型）。"
+reason = "F3 生成段已接入（2026-11-02）：与 C# ChatClientFactory 同构——base_url 覆盖指向任意 OpenAI 兼容端点，不区分厂商只认协议。供应商配置在库（providers/provider_models，C# 迁移的 zhipu/siliconflow 两家带密钥），激活端点 + 默认模型从库解析；未配置报 MODEL_NOT_CONFIGURED 不静默。F7 通用对话复用同一个 ChatClient 与平台级配置，不另建 SDK/供应商；core 层 forbidden_modules 仍含 openai（core 不许碰模型）。"
 
 [[tool.agentworkbench.component]]
 capability = "口令哈希"

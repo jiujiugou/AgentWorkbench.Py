@@ -138,6 +138,32 @@ def test_title_is_required(conn: sqlite3.Connection) -> None:
         conn.execute(INSERT_CONVERSATION, ("conv-x", "alice", "team-a", None, NOW, NOW))
 
 
+def test_kind_defaults_to_knowledge_and_cannot_be_rewritten(conn: sqlite3.Connection) -> None:
+    """kind 是创建时二选一的合同，不是运行时可改的 mode（F7 §3.1）。
+
+    默认 knowledge 只为把 F7 之前的会话接上来；新入口显式写 general。
+    触发器挡住 UPDATE：改 kind 会让同一条历史里混入两套答案合同。
+    """
+    make_conversation(conn)
+    row = conn.execute("select kind from conversations where id = 'conv-1'").fetchone()
+    assert row is not None
+    assert row["kind"] == "knowledge"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("update conversations set kind = 'general' where id = 'conv-1'")
+    row = conn.execute("select kind from conversations where id = 'conv-1'").fetchone()
+    assert row is not None
+    assert row["kind"] == "knowledge"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "insert into conversations"
+            " (id, user_id, tenant_id, kind, title, created_at, updated_at)"
+            " values ('conv-bad', 'alice', 'team-a', 'other', '标题', ?, ?)",
+            (NOW, NOW),
+        )
+
+
 def test_role_accepts_only_the_two_enum_values(conn: sqlite3.Connection) -> None:
     """role 只有 user / assistant，取值来自 `core.conversation.MessageRole`。
 

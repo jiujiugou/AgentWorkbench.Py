@@ -30,6 +30,7 @@ from agentworkbench.api.deps import Deps
 from agentworkbench.api.errors import not_found
 from agentworkbench.api.identity_context import owner_of
 from agentworkbench.chat import conversation as chat_turn
+from agentworkbench.core.conversation import ConversationKind
 from agentworkbench.core.runs import RunReasonCode, RunStatus, StepKind
 from agentworkbench.db.repositories import conversations as repo
 from agentworkbench.trace.reader import RunTrace, read_run
@@ -54,6 +55,7 @@ class ConversationDto(BaseModel):
 
     id: str
     title: str
+    kind: ConversationKind
     created_at: str
     updated_at: str
 
@@ -101,6 +103,7 @@ class MessagesDto(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     conversation_id: str
+    kind: ConversationKind
     messages: list[MessageDto]
 
 
@@ -144,15 +147,21 @@ class TraceDto(BaseModel):
 
 
 @router.get("/api/conversations")
-def list_conversations(request: Request) -> list[ConversationDto]:
-    """裸数组，按 `updated_at DESC, id DESC`。过滤与排序都在 SQL 里。"""
+def list_conversations(
+    request: Request, kind: ConversationKind | None = None
+) -> list[ConversationDto]:
+    """裸数组，按 `updated_at DESC, id DESC`。过滤与排序都在 SQL 里。
+
+    `kind` 可选：不传时两类会话混排，每条仍带自己的类型；传了只返回该类型。
+    """
     deps = _deps(request)
     with closing(deps.open_conn()) as conn:
-        rows = repo.list_for_owner(conn, owner_of(conn, request))
+        rows = repo.list_for_owner(conn, owner_of(conn, request), kind=kind)
         return [
             ConversationDto(
                 id=str(row["id"]),
                 title=str(row["title"]),
+                kind=ConversationKind(str(row["kind"])),
                 created_at=str(row["created_at"]),
                 updated_at=str(row["updated_at"]),
             )
@@ -175,9 +184,14 @@ def list_messages(request: Request, conversation_id: str) -> MessagesDto:
             # 空会话（建了没说话）也是合法的历史。所以不能"取不到消息 = 404"，
             # 还得看会话本身在不在——但**只查一次，且在消息为空时才查**，
             # 免得正常路径多一次往返。
-            if repo.get(conn, owner, conversation_id) is None:
+            conversation = repo.get(conn, owner, conversation_id)
+            if conversation is None:
                 raise not_found(CONVERSATION_MISSING)
-            return MessagesDto(conversation_id=conversation_id, messages=[])
+            return MessagesDto(
+                conversation_id=conversation_id,
+                kind=ConversationKind(str(conversation["kind"])),
+                messages=[],
+            )
 
         by_message: dict[int, list[CitationDto]] = {}
         for row in repo.list_citations(conn, owner, conversation_id):
@@ -195,6 +209,7 @@ def list_messages(request: Request, conversation_id: str) -> MessagesDto:
 
         return MessagesDto(
             conversation_id=conversation_id,
+            kind=ConversationKind(str(messages[0]["conversation_kind"])),
             messages=[
                 MessageDto(
                     id=int(row["id"]),

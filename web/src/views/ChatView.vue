@@ -19,6 +19,25 @@ const atBottom = ref(true)
 const hasModels = computed(() => agent.modelOptions.length > 0)
 const providersWithModels = computed(() => agent.providers.filter((p) => p.models.length > 0))
 
+/** 当前会话的类型。切换入口 = 新建会话，不能在同一条历史里换合同。 */
+watch(
+  () => agent.conversationId,
+  (id) => {
+    const conversation = agent.conversations.find((c) => c.id === id)
+    if (conversation) knowledgeMode.value = conversation.kind === 'knowledge'
+  },
+)
+
+function setMode(knowledge: boolean): void {
+  if (knowledgeMode.value === knowledge) return
+  if (agent.generating) {
+    ElMessage.warning('生成中，请先停止或等待完成')
+    return
+  }
+  knowledgeMode.value = knowledge
+  agent.newChat()
+}
+
 const currentTitle = computed(() => {
   const c = agent.conversations.find((x) => x.id === agent.conversationId)
   return c ? agent.titleFor(c) : '新对话'
@@ -111,13 +130,15 @@ onMounted(() => {
     <header class="chat-header">
       <div class="chat-heading">
         <h1 class="chat-title" :title="currentTitle">{{ currentTitle }}</h1>
-        <span v-if="knowledgeMode" class="mode-badge">知识库问答</span>
+        <span class="mode-badge" :class="{ general: !knowledgeMode }">
+          {{ knowledgeMode ? '知识库问答' : '通用对话 · 未使用企业资料' }}
+        </span>
       </div>
 
       <div class="chat-actions">
         <div class="mode-toggle">
-          <button :class="{ on: !knowledgeMode }" @click="knowledgeMode = false">对话</button>
-          <button :class="{ on: knowledgeMode }" @click="knowledgeMode = true">知识库问答</button>
+          <button :class="{ on: !knowledgeMode }" @click="setMode(false)">对话</button>
+          <button :class="{ on: knowledgeMode }" @click="setMode(true)">知识库问答</button>
         </div>
 
         <el-select
@@ -170,6 +191,7 @@ onMounted(() => {
             v-for="m in agent.messages"
             :key="m.id"
             :message="m"
+            :mode="m.mode"
             :sources="agent.sources[m.id]"
             :citations="agent.citations[m.id]"
             :refusal="agent.refusals[m.id]"
@@ -267,6 +289,12 @@ onMounted(() => {
   background: var(--el-color-primary-light-9);
   border-radius: var(--aw-radius-full);
   padding: 2px 10px;
+}
+
+.mode-badge.general {
+  color: var(--aw-text-2);
+  background: var(--aw-surface-3);
+  border: 1px solid var(--aw-border);
 }
 
 .chat-actions {

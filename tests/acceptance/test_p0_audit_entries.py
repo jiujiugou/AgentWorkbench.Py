@@ -79,6 +79,13 @@ def _invoke_runs(teams: TwoTeams) -> tuple[str, str]:
     return _invoke_runs_until(teams, {"succeeded", "refused"})
 
 
+def _invoke_chat(teams: TwoTeams) -> tuple[str, str]:
+    response = teams.client_a.post("/api/chat", json={"question": QUESTION})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    return str(body["runId"]), str(body["conversationId"])
+
+
 def _messages(teams: TwoTeams, conversation_id: str) -> list[dict[str, Any]]:
     response = teams.client_a.get(f"/api/conversations/{conversation_id}/messages")
     assert response.status_code == 200, response.text
@@ -98,6 +105,7 @@ def _conversation_count(teams: TwoTeams) -> int:
 INVOKERS = {
     ("POST", "/api/knowledge/ask"): _invoke_ask,
     ("POST", "/api/runs"): _invoke_runs,
+    ("POST", "/api/chat"): _invoke_chat,
 }
 
 
@@ -265,6 +273,8 @@ def test_model_resolution_failure_writes_nothing(teams: TwoTeams, route: tuple[s
             "/api/knowledge/ask",
             json={"question": QUESTION, "conversationId": teams.conv_a},
         )
+    elif route == ("POST", "/api/chat"):
+        response = teams.client_a.post("/api/chat", json={"question": QUESTION})
     else:
         response = teams.client_a.post("/api/runs", json={"question": QUESTION})
 
@@ -323,7 +333,12 @@ def test_only_declared_entrypoints_call_start_turn_or_503() -> None:
     assert _modules_calling("start_turn_or_503") == {
         "agentworkbench.api.routes.knowledge",
         "agentworkbench.api.routes.runs",
+        "agentworkbench.api.routes.chat",
     }
+
+
+def test_only_declared_entrypoints_call_execute_general_turn() -> None:
+    assert _modules_calling("execute_general_turn") == {"agentworkbench.api.routes.chat"}
 
 
 @pytest.mark.parametrize(

@@ -23,7 +23,7 @@ import sqlite3
 from dataclasses import dataclass
 from uuid import uuid4
 
-from agentworkbench.core.conversation import MessageRole, derive_title
+from agentworkbench.core.conversation import ConversationKind, MessageRole, derive_title
 from agentworkbench.core.identity import Owner
 from agentworkbench.db.repositories import conversations as repo
 
@@ -37,6 +37,7 @@ class StartedTurn:
     conversation_id: str
     created: bool
     user_message_id: int
+    kind: ConversationKind
 
 
 def start_turn(
@@ -45,6 +46,7 @@ def start_turn(
     *,
     question: str,
     conversation_id: str | None = None,
+    kind: ConversationKind = ConversationKind.KNOWLEDGE,
     now: str,
 ) -> StartedTurn:
     """开一轮：定位/新建会话，然后把用户那句话落行。
@@ -64,6 +66,10 @@ def start_turn(
         # 他人的 id 查到 `None`，与"查不到"走同一条路：**不复用、不报错**。
         # 报错会泄漏"这条 id 存在"，复用会把内容写进他人历史。
         target = None if conversation_id is None else repo.get(conn, owner, conversation_id)
+        # 类型不匹配同样当作"不可续聊"：通用入口拿到知识库会话 id 时新开一条，
+        # 而不是把通用回答写进原会话。原会话的 kind 一个字节都不改。
+        if target is not None and str(target["kind"]) != kind.value:
+            target = None
         created = target is None
         if target is None:
             resolved = uuid4().hex
@@ -72,6 +78,7 @@ def start_turn(
                 owner,
                 conversation_id=resolved,
                 title=derive_title(question),
+                kind=kind,
                 now=now,
             )
         else:
@@ -88,7 +95,12 @@ def start_turn(
         )
         repo.touch(conn, owner, resolved, now=now)
 
-    return StartedTurn(conversation_id=resolved, created=created, user_message_id=user_message_id)
+    return StartedTurn(
+        conversation_id=resolved,
+        created=created,
+        user_message_id=user_message_id,
+        kind=kind,
+    )
 
 
 def delete_conversation(conn: sqlite3.Connection, owner: Owner, conversation_id: str) -> int | None:

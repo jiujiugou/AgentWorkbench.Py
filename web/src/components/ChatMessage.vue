@@ -9,6 +9,8 @@ import RunTrace from '@/components/RunTrace.vue'
 
 const props = defineProps<{
   message: ChatMessage
+  /** 这条会话的答案合同。general 时必须显示“未使用企业资料”。 */
+  mode?: 'knowledge' | 'general'
   sources?: RetrievalSource[]
   citations?: CitationReport
   refusal?: RefusalInfo
@@ -133,6 +135,10 @@ function pageLabel(s: RetrievalSource): string {
           <p class="refusal-text">{{ refusal.text }}</p>
         </div>
         <template v-else-if="message.role === 'assistant'">
+          <div v-if="mode === 'general'" class="general-note">
+            <span class="general-tag">通用对话</span>
+            <span class="general-text">未使用企业资料</span>
+          </div>
           <div v-if="supportNote" class="support-note">
             <span class="support-tag">无资料支撑</span>
             <span class="support-text">{{ supportNote }}</span>
@@ -718,6 +724,32 @@ function pageLabel(s: RetrievalSource): string {
 }
 
 /* ---------- 无资料支撑 ---------- */
+/* 通用对话的合同标识：它不是“资料不足”，也不是拒答；它只是明确告诉
+   读者这条回答没有企业资料依据。与知识库回答必须一眼可分（D-V2）。 */
+.general-note {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: var(--aw-radius-l);
+  border-left: 3px solid var(--aw-primary);
+  background: var(--el-color-primary-light-9);
+}
+
+.general-tag {
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--aw-primary);
+}
+
+.general-text {
+  font-size: 12px;
+  color: var(--aw-text-3);
+  line-height: 1.5;
+}
+
 /* 与拒答卡片刻意区别：拒答是系统不给答案（橙色粗边框、独立卡片）；
    这一层答案照给，只是先告诉读者"下面没有出处可核"，所以是正文上方的一条窄提示，不遮内容。 */
 .support-note {

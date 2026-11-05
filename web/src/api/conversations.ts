@@ -10,9 +10,13 @@
 import type { RunSummary, ToolStepEvent } from '@/types'
 import { handle } from './http'
 
+export type ConversationKind = 'knowledge' | 'general'
+
 export interface Conversation {
   id: string
   title: string
+  /** 创建时固定：knowledge = 有证据才答；general = 不检索、不引用。 */
+  kind: ConversationKind
   createdAt: string
   updatedAt: string
 }
@@ -52,10 +56,11 @@ export interface ConversationMessage {
   citations: HistoryCitation[]
 }
 
-/** `/messages` 的外层。**不是裸数组**：引用是按消息挂的，两条消息各带各的卡片，
- *  裸数组装不下这个关系。这里解包成数组，调用方不必知道外层存在。 */
-interface MessagesResponse {
+/** `/messages` 的外层。**不是裸数组**：引用按消息挂，外层还带会话类型，
+ *  界面据此决定要不要显示“未使用企业资料”。 */
+export interface MessagesResponse {
   conversationId: string
+  kind: ConversationKind
   messages: ConversationMessage[]
 }
 
@@ -97,9 +102,7 @@ export interface Trace {
 export const conversationsApi = {
   list: () => fetch('/api/conversations').then((r) => handle<Conversation[]>(r)),
   messages: (id: string) =>
-    fetch(`/api/conversations/${id}/messages`)
-      .then((r) => handle<MessagesResponse>(r))
-      .then((body) => body.messages),
+    fetch(`/api/conversations/${id}/messages`).then((r) => handle<MessagesResponse>(r)),
   /** 一次运行的完整回放。路径挂在 `/api/runs` 下：轨迹的主键就是 run，不是会话。 */
   trace: (runId: string) => fetch(`/api/runs/${runId}/trace`).then((r) => handle<Trace>(r)),
   remove: (id: string) => fetch(`/api/conversations/${id}`, { method: 'DELETE' }),
