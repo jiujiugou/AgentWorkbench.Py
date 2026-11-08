@@ -96,3 +96,4 @@ class CitationSnapshot:
     check_first: CitationFirstCheck
     check_second: CitationSecondCheck | None = None
     coverage: float | None = None
+    kb_id: str | None = None

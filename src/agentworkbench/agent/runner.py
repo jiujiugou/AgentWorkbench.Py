@@ -126,6 +126,7 @@ def evidence_digest(hits: list[RetrievalHit]) -> str:
                     "page_from": h.page_from,
                     "page_to": h.page_to,
                     "vector_distance": h.vector_distance,
+                    "kb_id": h.kb_id,
                 }
                 for h in hits
             ],
@@ -147,6 +148,7 @@ def ask(
     model_name: str | None = None,
     coverage_threshold: float | None = None,
     top_k: int = 5,
+    kb_ids: frozenset[str] | None = None,
     on_started: Callable[[str], None] | None = None,
 ) -> AskResult:
     """跑一次完整问答，并留下一次 run。
@@ -180,7 +182,12 @@ def ask(
         # ① 检索：必调一次。tools ≥ 1 由这一行保证（G5）。
         with recorder.step(StepKind.RETRIEVAL) as step:
             hits: list[RetrievalHit] = retrieve(
-                conn, question, embedder=embedder, tenant_id=tenant_id, top_k=top_k
+                conn,
+                question,
+                embedder=embedder,
+                tenant_id=tenant_id,
+                kb_ids=kb_ids,
+                top_k=top_k,
             )
             step.output = evidence_digest(hits)
         # ② 判定 + 装填：同一份结果，判定写进证据（D-03）。不成步——

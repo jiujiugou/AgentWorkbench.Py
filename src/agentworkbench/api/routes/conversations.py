@@ -28,11 +28,12 @@ from pydantic.alias_generators import to_camel
 
 from agentworkbench.api.deps import Deps
 from agentworkbench.api.errors import not_found
-from agentworkbench.api.identity_context import owner_of
+from agentworkbench.api.identity_context import current_principal, owner_of
 from agentworkbench.chat import conversation as chat_turn
 from agentworkbench.core.conversation import ConversationKind
 from agentworkbench.core.runs import RunReasonCode, RunStatus, StepKind
 from agentworkbench.db.repositories import conversations as repo
+from agentworkbench.db.repositories import knowledge as knowledge_repo
 from agentworkbench.trace.reader import RunTrace, read_run
 
 router = APIRouter()
@@ -193,17 +194,30 @@ def list_messages(request: Request, conversation_id: str) -> MessagesDto:
                 messages=[],
             )
 
+        principal = current_principal(request)
+        accessible = knowledge_repo.accessible_kb_ids(
+            conn, tenant_id=owner.tenant_id, level_rank=principal.level_rank
+        )
         by_message: dict[int, list[CitationDto]] = {}
         for row in repo.list_citations(conn, owner, conversation_id):
+            kb_id = None if row["kb_id"] is None else str(row["kb_id"])
+            visible = kb_id is None or kb_id in accessible
             by_message.setdefault(int(row["message_id"]), []).append(
                 CitationDto(
                     no=int(row["no"]),
-                    file_name=str(row["file_name"]),
-                    seq=int(row["seq"]),
-                    excerpt=str(row["excerpt"]),
+                    # 不可访问时不回显文件名/片段/页码；占位只说明曾有一条来源。
+                    file_name=str(row["file_name"]) if visible else "来源已不可访问",
+                    seq=int(row["seq"]) if visible else 0,
+                    excerpt=str(row["excerpt"]) if visible else "",
                     check_first=str(row["check_first"]),
-                    check_second=None if row["check_second"] is None else str(row["check_second"]),
-                    coverage=None if row["coverage"] is None else float(row["coverage"]),
+                    check_second=(
+                        None
+                        if not visible or row["check_second"] is None
+                        else str(row["check_second"])
+                    ),
+                    coverage=(
+                        None if not visible or row["coverage"] is None else float(row["coverage"])
+                    ),
                 )
             )
 
@@ -262,7 +276,12 @@ def get_trace(request: Request, run_id: str) -> TraceDto:
     """
     deps = _deps(request)
     with closing(deps.open_conn()) as conn:
-        trace = read_run(conn, owner_of(conn, request), run_id)
+        owner = owner_of(conn, request)
+        principal = current_principal(request)
+        accessible = knowledge_repo.accessible_kb_ids(
+            conn, tenant_id=owner.tenant_id, level_rank=principal.level_rank
+        )
+        trace = read_run(conn, owner, run_id, kb_ids=accessible)
         if trace is None:
             raise not_found(RUN_MISSING)
         return _trace_dto(trace)

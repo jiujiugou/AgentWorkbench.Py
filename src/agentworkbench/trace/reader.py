@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 
@@ -74,7 +75,28 @@ class RunTrace:
     steps: tuple[TraceStep, ...]
 
 
-def read_run(conn: sqlite3.Connection, owner: Owner, run_id: str) -> RunTrace | None:
+def find_running_for_owner(
+    conn: sqlite3.Connection,
+    owner: Owner,
+    *,
+    conversation_id: str | None = None,
+) -> str | None:
+    """找当前用户最新的 `running` run。
+
+    读侧只暴露 id，不把仓储交给 api：`test_trace_write_port` 要求
+    `db.repositories.runs` 只被 trace 层 import。停止路由拿到 id 后仍走
+    `trace.recorder.cancel_run` 这个唯一写入口。
+    """
+    return runs_repo.find_running_for_owner(conn, owner, conversation_id=conversation_id)
+
+
+def read_run(
+    conn: sqlite3.Connection,
+    owner: Owner,
+    run_id: str,
+    *,
+    kb_ids: frozenset[str] | None = None,
+) -> RunTrace | None:
     """读一次运行的轨迹。`None` = 不存在，或者不是你的——两者不给区分。
 
     `citation_out_of_range` / `citation_unsupported` 为 `None` 表示**没有正文可校验**
@@ -86,7 +108,9 @@ def read_run(conn: sqlite3.Connection, owner: Owner, run_id: str) -> RunTrace | 
     if row is None:
         return None
 
-    steps = tuple(_step_of(step) for step in runs_repo.list_steps_for_owner(conn, owner, run_id))
+    steps = tuple(
+        _step_of(step, kb_ids) for step in runs_repo.list_steps_for_owner(conn, owner, run_id)
+    )
 
     return RunTrace(
         run_id=str(row["id"]),
@@ -113,14 +137,54 @@ def read_run(conn: sqlite3.Connection, owner: Owner, run_id: str) -> RunTrace | 
     )
 
 
-def _step_of(row: sqlite3.Row) -> TraceStep:
-    """一行 → 一步。字符串列按原样取，不做长度处理。"""
-    return TraceStep(
+def _redact_retrieval_output(output: str | None, kb_ids: frozenset[str]) -> str | None:
+    """把检索步骤里不可访问的命中从证据摘要中删掉。
+
+    **只删不可访问的条目，不删整步**：删整步会让一次真实的检索看起来
+    「没有发生过」；保留一个 `redacted` 计数，用户知道这里被过滤过，
+    但看不到文件名、片段或页码。旧记录没有 `kb_id` 的条目按兼容保留。
+    """
+    if output is None:
+        return None
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return output
+    if not isinstance(payload, dict) or not isinstance(payload.get("top"), list):
+        return output
+    kept: list[object] = []
+    redacted = 0
+    for item in payload["top"]:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        kb_id = item.get("kb_id")
+        if kb_id is not None and str(kb_id) not in kb_ids:
+            redacted += 1
+            continue
+        kept.append(item)
+    if redacted == 0:
+        return output
+    return json.dumps(
+        {**payload, "top": kept, "hits": len(kept), "redacted": redacted},
+        ensure_ascii=False,
+    )
+
+
+def _step_of(row: sqlite3.Row, kb_ids: frozenset[str] | None = None) -> TraceStep:
+    """一行 → 一步。字符串列按原样取，不做长度处理。
+
+    `kb_ids` 非空时只过滤检索步骤的证据摘要；答案正文与错误原样保留。
+    """
+    output = None if row["output"] is None else str(row["output"])
+    if kb_ids is not None and StepKind(str(row["kind"])) is StepKind.RETRIEVAL:
+        output = _redact_retrieval_output(output, kb_ids)
+    step = TraceStep(
         seq=int(row["seq"]),
         kind=StepKind(str(row["kind"])),
         tool_name=None if row["tool_name"] is None else str(row["tool_name"]),
         input=None if row["input"] is None else str(row["input"]),
-        output=None if row["output"] is None else str(row["output"]),
+        output=output,
         error=None if row["error"] is None else str(row["error"]),
         model=None if row["model"] is None else str(row["model"]),
         duration_ms=None if row["duration_ms"] is None else int(row["duration_ms"]),
@@ -130,3 +194,4 @@ def _step_of(row: sqlite3.Row) -> TraceStep:
         ),
         created_at=str(row["created_at"]),
     )
+    return step

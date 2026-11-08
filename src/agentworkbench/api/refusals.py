@@ -58,6 +58,8 @@ _RESOURCE_KINDS: Final[dict[str, str]] = {
     "run_id": "run",
     "user_id": "user",
     "provider_id": "provider",
+    "kb_id": "knowledge_base",
+    "invite_id": "invite",
     "token": "invite",
 }
 """路径参数名 → 资源种类。

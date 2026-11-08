@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import sqlite_vec  # type: ignore[import-untyped]
@@ -159,6 +160,8 @@ CREATE TABLE IF NOT EXISTS message_citations (
     -- 复制，不替它编一个结论
     check_second TEXT CHECK (check_second IS NULL OR check_second IN ({_SECOND_CHECK_VALUES})),
     coverage     REAL,
+    -- 引用快照来自哪个知识库。不可访问时只显示占位，不回显文件名/片段（F5 §1.11）。
+    kb_id        TEXT,
     UNIQUE (message_id, no)
 );
 """
@@ -255,6 +258,9 @@ CREATE TABLE IF NOT EXISTS users (
     -- 本人改密清 0；存量账号默认 0，升级后不被误伤。
     must_change_password INTEGER NOT NULL DEFAULT 0
         CHECK (must_change_password IN (0, 1)),
+    -- 账号等级（F1 / REQ-25）：1~5，独立于 role 与 is_platform_admin。
+    -- 默认 1 让存量账号升级后仍是普通可见范围；引导管理员由服务层显式升到 5。
+    level_rank INTEGER NOT NULL DEFAULT 1 CHECK (level_rank BETWEEN 1 AND 5),
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -323,7 +329,67 @@ CREATE INDEX IF NOT EXISTS ix_identity_events_request ON identity_events(request
 """
 
 
-# 表结构对齐 C# 现状，只做三处增补（都是「现在加免费，以后加要迁移」的）：
+KNOWLEDGE_SCHEMA_SQL = """
+-- 账号等级（F1 / REQ-25）。表本身只给名称与排序；users.level_rank 只存整数。
+CREATE TABLE IF NOT EXISTS account_levels (
+    rank       INTEGER PRIMARY KEY CHECK (rank BETWEEN 1 AND 5),
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO account_levels(rank, name, created_at) VALUES
+    (1, 'L1', '1970-01-01T00:00:00'),
+    (2, 'L2', '1970-01-01T00:00:00'),
+    (3, 'L3', '1970-01-01T00:00:00'),
+    (4, 'L4', '1970-01-01T00:00:00'),
+    (5, 'L5', '1970-01-01T00:00:00');
+
+-- 知识库（F2 / REQ-24）。刻意没有 tenant 外键：测试与旧库可能存在
+-- 只有 documents.tenant_id、没有 tenants 行的数据；外键会让默认库建不出来，
+-- 而「没有默认库」会把存量文档全部变成不可见。团队边界仍由查询条件保证。
+CREATE TABLE IF NOT EXISTS knowledge_bases (
+    id             TEXT PRIMARY KEY,
+    tenant_id      TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    visibility     TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
+    min_level_rank INTEGER CHECK (min_level_rank BETWEEN 1 AND 5),
+    is_default     INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+    created_by     TEXT,
+    archived_at    TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    CHECK (
+        (visibility = 'public' AND min_level_rank IS NULL)
+        OR (visibility = 'private' AND min_level_rank IS NOT NULL)
+    ),
+    UNIQUE (tenant_id, name)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_knowledge_bases_default
+    ON knowledge_bases(tenant_id) WHERE is_default = 1;
+CREATE INDEX IF NOT EXISTS ix_knowledge_bases_tenant
+    ON knowledge_bases(tenant_id, archived_at);
+
+-- 管理员操作审计（F1 §1.10）。与 identity_events 分开：后者只记拒绝，
+-- 这张表记「谁改了账号/等级/知识库」，两者混在一起会让读侧问错问题。
+CREATE TABLE IF NOT EXISTS admin_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       TEXT NOT NULL UNIQUE,
+    occurred_at    TEXT NOT NULL,
+    actor_user_id  TEXT,
+    tenant_id      TEXT,
+    target_user_id TEXT,
+    action         TEXT NOT NULL,
+    resource_kind  TEXT,
+    resource_id    TEXT,
+    old_value      TEXT,
+    new_value      TEXT,
+    request_id     TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_admin_events_tenant_time
+    ON admin_events(tenant_id, occurred_at);
+"""
+
+
+# 表结构对齐 C# 现状，只做三处增补（都是「现在加免费，以后要迁移」的）：
 #   documents.tenant_id      —— 跨团队隔离的前提
 #   documents.error_code     —— 失败原因可统计（F2 §三-1）
 #   documents.updated_at     —— V-7 的 T 靠它算，否则"卡死"无法判定
@@ -342,10 +408,13 @@ CREATE TABLE IF NOT EXISTS documents (
     error       TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
-    parsed_at   TEXT
+    parsed_at   TEXT,
+    -- 文档继承知识库可见性（REQ-24）。老库由 ensure_knowledge_schema 回填；
+    -- 新写入必须显式带 kb_id，触发器只兜底旧测试夹具与手工 SQL。
+    kb_id       TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_tenant_sha256
-    ON documents(tenant_id, sha256);
+-- 去重/知识库索引在 ensure_knowledge_schema 里建：老库的 documents
+-- 还没有 kb_id 列，建表脚本阶段建索引会直接报 no such column。
 
 CREATE TABLE IF NOT EXISTS document_pages (
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -395,6 +464,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks_vec USING vec0(
     # 身份与访问（F1）：tenants 必须最先建（users 指向它），tickets / invites
     # 次之，identity_events 无外键、放最后只为读起来顺
     + IDENTITY_SCHEMA_SQL
+    # 账号等级 / 知识库 / 管理员操作审计（REQ-24 / REQ-25）
+    + KNOWLEDGE_SCHEMA_SQL
 )
 
 
@@ -541,6 +612,158 @@ def ensure_conversation_kind_column(conn: sqlite3.Connection) -> bool:
     return added
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"pragma table_info({table})").fetchall()}
+
+
+def _ensure_default_kb(conn: sqlite3.Connection, tenant_id: str, *, now: datetime) -> str:
+    """确保团队有一个默认公共知识库，返回 id。
+
+    id 用确定性前缀而不是随机值：启动期与迁移都会跑，随机 id 会让同一团队
+    每次多出一个「默认库」，而唯一默认索引当场报错。
+    """
+    existing = conn.execute(
+        "select id from knowledge_bases where tenant_id = ? and is_default = 1",
+        (tenant_id,),
+    ).fetchone()
+    if existing is not None:
+        return str(existing["id"])
+    kb_id = f"kb-default-{tenant_id}"
+    moment = now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        "insert or ignore into knowledge_bases"
+        " (id, tenant_id, name, visibility, min_level_rank, is_default,"
+        "  created_by, archived_at, created_at, updated_at)"
+        " values (?, ?, '公共知识库', 'public', null, 1, null, null, ?, ?)",
+        (kb_id, tenant_id, moment, moment),
+    )
+    row = conn.execute(
+        "select id from knowledge_bases where tenant_id = ? and is_default = 1",
+        (tenant_id,),
+    ).fetchone()
+    return str(row["id"]) if row is not None else kb_id
+
+
+def ensure_knowledge_schema(conn: sqlite3.Connection) -> bool:
+    """补账号等级 / 知识库 / 引用 kb_id，并回填默认公共知识库。
+
+    启动期与 Alembic 0009 共用这一份。**只做向后兼容的加列与建表**：
+    真正的结构变更仍走 Alembic；这里重复执行是空操作。
+
+    关键顺序：先补列，再建表/索引，再回填文档，最后替换去重索引。
+    如果先建 `(tenant_id, kb_id, sha256)` 唯一索引，旧库里的 null kb_id
+    会让「同一团队多份文档」不受约束；回填后再建索引，才能把
+    「同一文件在同一个知识库只能一份」变成真正的约束。
+    """
+    added = False
+    if "level_rank" not in _columns(conn, "users"):
+        try:
+            conn.execute(
+                "alter table users add column level_rank integer not null default 1"
+                " check (level_rank between 1 and 5)"
+            )
+            added = True
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    if "kb_id" not in _columns(conn, "documents"):
+        try:
+            conn.execute("alter table documents add column kb_id text")
+            added = True
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    if "kb_id" not in _columns(conn, "message_citations"):
+        try:
+            conn.execute("alter table message_citations add column kb_id text")
+            added = True
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+    conn.executescript(KNOWLEDGE_SCHEMA_SQL)
+
+    now = datetime.now(UTC)
+    tenant_rows = conn.execute(
+        "select id as tenant_id from tenants"
+        " union select distinct tenant_id from users"
+        " union select distinct tenant_id from documents"
+        " union select distinct tenant_id from knowledge_bases"
+    ).fetchall()
+    default_by_tenant = {
+        str(row["tenant_id"]): _ensure_default_kb(conn, str(row["tenant_id"]), now=now)
+        for row in tenant_rows
+        if str(row["tenant_id"]).strip()
+    }
+
+    for tenant_id, kb_id in default_by_tenant.items():
+        conn.execute(
+            "update documents set kb_id = ? where tenant_id = ? and kb_id is null",
+            (kb_id, tenant_id),
+        )
+        conn.execute(
+            "update message_citations set kb_id = ("
+            "  select kb.id from messages m"
+            "  join conversations c on c.id = m.conversation_id"
+            "  join knowledge_bases kb on kb.tenant_id = c.tenant_id and kb.is_default = 1"
+            "  where m.id = message_citations.message_id limit 1"
+            ") where kb_id is null and message_id in ("
+            "  select m.id from messages m join conversations c on c.id = m.conversation_id"
+            "  where c.tenant_id = ?"
+            ")",
+            (tenant_id,),
+        )
+
+    # 新团队自动建默认公共库；新文档漏传 kb_id 时兜底到默认库。
+    conn.execute(
+        "create trigger if not exists trg_tenant_default_kb after insert on tenants"
+        " begin"
+        "   insert or ignore into knowledge_bases"
+        "     (id, tenant_id, name, visibility, min_level_rank, is_default,"
+        "      created_by, archived_at, created_at, updated_at)"
+        "   values ('kb-default-' || new.id, new.id, '公共知识库', 'public', null, 1,"
+        "           null, null, new.created_at, new.created_at);"
+        " end"
+    )
+    conn.execute(
+        "create trigger if not exists trg_documents_default_kb after insert on documents"
+        " when new.kb_id is null"
+        " begin"
+        "   insert or ignore into knowledge_bases"
+        "     (id, tenant_id, name, visibility, min_level_rank, is_default,"
+        "      created_by, archived_at, created_at, updated_at)"
+        "   values ('kb-default-' || new.tenant_id, new.tenant_id, '公共知识库',"
+        "           'public', null, 1, null, null, new.created_at, new.created_at);"
+        "   update documents set kb_id = ("
+        "     select id from knowledge_bases where tenant_id = new.tenant_id"
+        "     and is_default = 1 limit 1"
+        "   ) where id = new.id and kb_id is null;"
+        " end"
+    )
+    conn.execute(
+        "create trigger if not exists trg_message_citations_default_kb"
+        " after insert on message_citations"
+        " when new.kb_id is null"
+        " begin"
+        "   update message_citations set kb_id = ("
+        "     select kb.id from messages m"
+        "     join conversations c on c.id = m.conversation_id"
+        "     join knowledge_bases kb on kb.tenant_id = c.tenant_id and kb.is_default = 1"
+        "     where m.id = new.message_id limit 1"
+        "   ) where id = new.id and kb_id is null;"
+        " end"
+    )
+
+    # 旧去重索引必须换成按知识库去重；否则私人库/公共库不能各存一份。
+    conn.execute("drop index if exists ux_documents_tenant_sha256")
+    conn.execute(
+        "create unique index if not exists ux_documents_tenant_kb_sha256"
+        " on documents(tenant_id, kb_id, sha256)"
+    )
+    conn.execute("create index if not exists ix_documents_tenant_kb on documents(tenant_id, kb_id)")
+    return added
+
+
 def create_schema(conn: sqlite3.Connection) -> None:
     """建表。幂等，空库起服务时调一次。
 
@@ -550,4 +773,5 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     ensure_must_change_password_column(conn)
     ensure_conversation_kind_column(conn)
+    ensure_knowledge_schema(conn)
     conn.commit()

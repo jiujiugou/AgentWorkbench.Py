@@ -72,6 +72,7 @@ def execute_turn(
     conversation_id: str,
     chat: object,
     model_name: str,
+    kb_ids: frozenset[str] | None = None,
 ) -> AskResult:
     """③④ 两步：作答 + 落回答。同步与异步的**同一段代码**。"""
     recorder = Recorder(conn, user_id=owner.user_id, tenant_id=owner.tenant_id)
@@ -86,6 +87,7 @@ def execute_turn(
             # 这一行就是 I-V2 的落点：`runner.ask` 早就有这个参数，
             # 而在此之前从来没有人传过它——签名对了但没人传，是这条判据最典型的坑。
             tenant_id=owner.tenant_id,
+            kb_ids=kb_ids,
             refuse_margin=deps.settings.refuse_margin,
             sufficient_distance=deps.settings.sufficient_distance,
             coverage_threshold=deps.settings.coverage_threshold,

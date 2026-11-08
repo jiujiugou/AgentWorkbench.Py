@@ -29,15 +29,17 @@ from agentworkbench.api.deps import Deps, build_deps
 from agentworkbench.api.identity_context import require_session
 from agentworkbench.api.request_context import RequestContextMiddleware
 from agentworkbench.api.routes import (
-    chat as chat_api,
-)
-from agentworkbench.api.routes import (
+    admin,
     conversations,
     documents,
     identity,
     knowledge,
+    knowledge_bases,
     members,
     runs,
+)
+from agentworkbench.api.routes import (
+    chat as chat_api,
 )
 
 # `settings` 与 create_app 的参数同名，导入时起别名——不遮蔽，遮蔽的报错是
@@ -273,6 +275,8 @@ def create_app(
 
     app.include_router(documents.router)
     app.include_router(knowledge.router)
+    app.include_router(knowledge_bases.router)
+    app.include_router(admin.router)
     app.include_router(chat_api.router)
     app.include_router(conversations.router)
     app.include_router(settings_api.router)

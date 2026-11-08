@@ -225,6 +225,7 @@ class NumberedHit:
     page_to: int
     heading: str | None
     vector_distance: float | None
+    kb_id: str | None = None
 
 
 @dataclass(frozen=True)

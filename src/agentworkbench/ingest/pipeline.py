@@ -56,6 +56,7 @@ def ingest(
     doc_id: str,
     max_bytes: int,
     allowed_suffixes: frozenset[str] = DEFAULT_ALLOWED_SUFFIXES,
+    kb_id: str | None = None,
 ) -> IngestResult:
     """收一份文件。返回时**只承诺 `pending`**，不承诺解析完。
 
@@ -75,7 +76,7 @@ def ingest(
 
     digest = storage.digest_of(data)
 
-    existing = repo.find_by_digest(conn, tenant_id=tenant_id, sha256=digest)
+    existing = repo.find_by_digest(conn, tenant_id=tenant_id, sha256=digest, kb_id=kb_id)
     if existing is not None:
         return IngestResult(document_id=str(existing["id"]), created=False, reject=None)
 
@@ -93,12 +94,13 @@ def ingest(
             sha256=digest,
             size_bytes=len(data),
             now=now,
+            kb_id=kb_id,
         )
         conn.commit()
     except sqlite3.IntegrityError:
         # 并发同传一份：输的一方没有新行，但盘上路径相同，不产生孤儿。
         conn.rollback()
-        winner = repo.find_by_digest(conn, tenant_id=tenant_id, sha256=digest)
+        winner = repo.find_by_digest(conn, tenant_id=tenant_id, sha256=digest, kb_id=kb_id)
         if winner is None:
             raise
         return IngestResult(document_id=str(winner["id"]), created=False, reject=None)

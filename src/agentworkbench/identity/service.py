@@ -55,8 +55,10 @@ __all__ = [
     "PasswordUnchanged",
     "accept_invite",
     "bootstrap",
+    "change_level",
     "change_password",
     "change_role",
+    "create_account",
     "create_invite",
     "disable_user",
     "enable_user",
@@ -389,6 +391,50 @@ def enable_user(conn: sqlite3.Connection, *, user_id: str, now: datetime) -> boo
         )
 
 
+def create_account(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    email: str,
+    password: str,
+    role: Role,
+    level_rank: int,
+    now: datetime,
+) -> str:
+    """管理员直接建号。**等级由调用方先按上限判过**；这里只做唯一性与写入。
+
+    不做「先查再插」的竞态防护：邮箱唯一索引是最终保证，撞了抛
+    `sqlite3.IntegrityError`，路由翻成 400。这里先查只是为了让正常路径
+    给出更可读的 `EmailAlreadyTaken`。
+    """
+    if store.get_user_by_email(conn, email) is not None:
+        raise EmailAlreadyTaken(email)
+    password_hash = credentials.hash_password(password)
+    with conn:
+        return store.insert_user(
+            conn,
+            tenant_id=tenant_id,
+            email=email,
+            password_hash=password_hash,
+            role=role,
+            level_rank=level_rank,
+            now=now,
+        )
+
+
+def change_level(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    expected: int,
+    target: int,
+    now: datetime,
+) -> bool:
+    """改等级。上限规则由 `policy.judge_level_assignment` 先判；这里只写。"""
+    with conn:
+        return store.set_level(conn, user_id, expected=expected, target=target, now=now)
+
+
 def change_role(
     conn: sqlite3.Connection,
     *,
@@ -522,6 +568,7 @@ def accept_invite(
                 password_hash=password_hash,
                 role=row.role,
                 now=now,
+                level_rank=1,
             )
             if not store.accept_invite(conn, row.invite_id, accepted_by=user_id, now=now):
                 # 并发的另一次已经用掉了这张邀请。抛出去让事务回滚，
@@ -594,5 +641,6 @@ def bootstrap(
             # 生产路径默认要求首登改密；测试/迁移若需要“已经轮换过”的账号，
             # 显式传 False，而不是把生产默认值改成安全的一侧之外。
             must_change_password=must_change_password,
+            level_rank=5,
         )
     return BootstrapResult(tenant_id=tenant_id, user_id=user_id)

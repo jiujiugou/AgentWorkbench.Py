@@ -24,7 +24,8 @@ from agentworkbench.agent import runner
 from agentworkbench.api.answer_flow import execute_turn, start_turn_or_503
 from agentworkbench.api.deps import Deps
 from agentworkbench.api.errors import validation_failed
-from agentworkbench.api.identity_context import owner_of
+from agentworkbench.api.identity_context import current_principal, owner_of
+from agentworkbench.db.repositories import knowledge as knowledge_repo
 from agentworkbench.rag.indexer import search_fts
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,18 @@ def search(request: Request, q: str, limit: int = 5) -> list[SearchHitDto]:
         # 团队范围来自登录身份。这条路由是「只检索不生成」的调试入口，
         # 但它同样会返回正文片段——不过滤的话，它就是一个绕开 ask 的读取口：
         # 问答里查不到的资料，在这个端点上搜得到（I-V2 的「检索结果」那一路）。
-        tenant_id = owner_of(conn, request).tenant_id
-        hits = search_fts(conn, q, tenant_id=tenant_id, limit=min(max(limit, 1), 50))
+        owner = owner_of(conn, request)
+        principal = current_principal(request)
+        kb_ids = knowledge_repo.accessible_kb_ids(
+            conn, tenant_id=owner.tenant_id, level_rank=principal.level_rank
+        )
+        hits = search_fts(
+            conn,
+            q,
+            tenant_id=owner.tenant_id,
+            limit=min(max(limit, 1), 50),
+            kb_ids=kb_ids,
+        )
         return [
             SearchHitDto(chunk_id=hit.chunk_id, document_id=hit.document_id, content=hit.content)
             for hit in hits
@@ -214,6 +225,10 @@ def ask(request: Request, payload: AskRequest) -> AskResponse:
 
     with closing(deps.open_conn()) as conn:
         owner = owner_of(conn, request)
+        principal = current_principal(request)
+        kb_ids = knowledge_repo.accessible_kb_ids(
+            conn, tenant_id=owner.tenant_id, level_rank=principal.level_rank
+        )
         # ① 模型没配 → 503，且**一行都不写**
         chat, model_name = deps.chat_factory(conn)
         # ② 开一轮：会话（标题只写一次）+ 用户消息，一个事务
@@ -229,6 +244,7 @@ def ask(request: Request, payload: AskRequest) -> AskResponse:
             conversation_id=started.conversation_id,
             chat=chat,
             model_name=model_name,
+            kb_ids=kb_ids,
         )
 
     return to_response(result, conversation_id=started.conversation_id)

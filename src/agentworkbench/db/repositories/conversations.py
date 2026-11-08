@@ -345,11 +345,11 @@ def insert_citations(
     if not snapshots:
         return
 
-    before = conn.total_changes
-    conn.executemany(
+    cursor = conn.executemany(
         "insert into message_citations("
-        "  message_id, no, file_name, seq, excerpt, check_first, check_second, coverage)"
-        " select ?, ?, ?, ?, ?, ?, ?, ?"
+        "  message_id, no, file_name, seq, excerpt, check_first, check_second, coverage,"
+        "  kb_id)"
+        " select ?, ?, ?, ?, ?, ?, ?, ?, ?"
         " where exists ("
         "   select 1 from messages m join conversations c on c.id = m.conversation_id"
         "    where m.id = ? and c.tenant_id = ? and c.user_id = ?)",
@@ -363,6 +363,7 @@ def insert_citations(
                 snapshot.check_first.value,
                 None if snapshot.check_second is None else snapshot.check_second.value,
                 snapshot.coverage,
+                snapshot.kb_id,
                 message_id,
                 owner.tenant_id,
                 owner.user_id,
@@ -370,7 +371,7 @@ def insert_citations(
             for snapshot in snapshots
         ],
     )
-    inserted = conn.total_changes - before
+    inserted = cursor.rowcount
     if inserted != len(snapshots):
         raise KeyError(
             f"引用快照未写全（{inserted}/{len(snapshots)}）：消息 {message_id} 不属于该用户"

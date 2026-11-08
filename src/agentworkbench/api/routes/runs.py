@@ -39,11 +39,14 @@ from pydantic.alias_generators import to_camel
 from agentworkbench.api.answer_flow import execute_turn, start_turn_or_503
 from agentworkbench.api.deps import Deps
 from agentworkbench.api.errors import not_found, validation_failed
-from agentworkbench.api.identity_context import owner_of
+from agentworkbench.api.identity_context import current_principal, owner_of
 from agentworkbench.api.routes.conversations import RUN_MISSING
 from agentworkbench.core.identity import Owner
+from agentworkbench.core.runs import RunStatus
 from agentworkbench.db.repositories import conversations as repo
-from agentworkbench.trace.reader import read_run
+from agentworkbench.db.repositories import knowledge as knowledge_repo
+from agentworkbench.trace import recorder
+from agentworkbench.trace.reader import find_running_for_owner, read_run
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,10 @@ def submit_run(request: Request, payload: SubmitRunBody) -> dict[str, str]:
 
     with closing(deps.open_conn()) as conn:
         owner = owner_of(conn, request)
+        principal = current_principal(request)
+        kb_ids = knowledge_repo.accessible_kb_ids(
+            conn, tenant_id=owner.tenant_id, level_rank=principal.level_rank
+        )
         # ① 模型解析：没配 → 503，一行不写。客户端构造好传进线程——
         # 配置错误在这里就失败，而不是 202 之后让一个注定失败的 run 去污染库
         chat, model_name = deps.chat_factory(conn)
@@ -109,7 +116,7 @@ def submit_run(request: Request, payload: SubmitRunBody) -> dict[str, str]:
     # ③ 执行：线程自开连接，不携带任何 Request / 路由层的连接
     thread = threading.Thread(
         target=_execute,
-        args=(deps, owner, question, started.conversation_id, chat, model_name),
+        args=(deps, owner, question, started.conversation_id, chat, model_name, kb_ids),
         name="run-executor",
         daemon=True,
     )
@@ -120,6 +127,65 @@ def submit_run(request: Request, payload: SubmitRunBody) -> dict[str, str]:
     return {"conversationId": started.conversation_id}
 
 
+class CancelRunBody(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    # 停止当前作答时前端拿不到 runId（run 行在生成开始后才创建，响应要等生成
+    # 结束才回来）。两个字段至少给一个方向：
+    # - runId：明确停哪一次（测试与程序化调用方）；
+    # - conversationId：停这条会话里最新的一次（已经知道会话 id 时更安全）；
+    # - 都不给：停当前用户最新的 running（界面同一时刻只允许一次生成）。
+    run_id: str | None = None
+    conversation_id: str | None = None
+
+
+class CancelRunDto(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    run_id: str | None
+    conversation_id: str | None
+    status: str | None
+    cancelled: bool
+
+
+@router.post("/api/runs/cancel")
+def cancel_run(request: Request, payload: CancelRunBody) -> CancelRunDto:
+    """停止一次运行：只收口状态，不启动作答、不产生新的 run（REQ-16）。
+
+    这条路由**不产 run**，所以登记在 `declarations.NOT_PRODUCING`。它做的
+    唯一一件事是把仍在 `running` 的那一行收口成 `cancelled`；迟到的模型
+    结果由 `close_step` 丢弃，不覆盖终态。
+    """
+    deps = cast(Deps, request.app.state.deps)
+
+    with closing(deps.open_conn()) as conn:
+        owner = owner_of(conn, request)
+        explicit = payload.run_id is not None
+        run_id = payload.run_id
+        if run_id is None:
+            run_id = find_running_for_owner(conn, owner, conversation_id=payload.conversation_id)
+            if run_id is None:
+                # 没有正在跑的 run：不是错误，停止按钮可能落在响应回来之后。
+                return CancelRunDto(run_id=None, conversation_id=None, status=None, cancelled=False)
+
+        status = recorder.cancel_run(conn, owner, run_id)
+        if status is None:
+            # 显式 id 时与状态查询同一条 404：不区分“不存在”和“不是你的”。
+            if explicit:
+                raise not_found(RUN_MISSING)
+            return CancelRunDto(run_id=None, conversation_id=None, status=None, cancelled=False)
+
+        message = repo.find_message_by_run(conn, owner, run_id)
+        conversation_id = None if message is None else str(message["conversation_id"])
+
+    return CancelRunDto(
+        run_id=run_id,
+        conversation_id=conversation_id,
+        status=status.value,
+        cancelled=status is RunStatus.CANCELLED,
+    )
+
+
 def _execute(
     deps: Deps,
     owner: Owner,
@@ -127,6 +193,7 @@ def _execute(
     conversation_id: str,
     chat: object,
     model_name: str,
+    kb_ids: frozenset[str] | None = None,
 ) -> None:
     thread = threading.current_thread()
     try:
@@ -140,6 +207,7 @@ def _execute(
                 conversation_id=conversation_id,
                 chat=chat,
                 model_name=model_name,
+                kb_ids=kb_ids,
             )
     except Exception:
         # 后台失败没有"响应"可背：run 行上已有终态与原因（recorder 收口），

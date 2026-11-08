@@ -43,6 +43,7 @@ class SearchHit:
     chunk_id: int
     document_id: str
     content: str
+    kb_id: str | None = None
 
 
 def write_index(
@@ -129,7 +130,11 @@ def count_index(conn: sqlite3.Connection, document_id: str) -> IndexCounts:
 
 
 def _match_rows(
-    conn: sqlite3.Connection, query: str, limit: int, tenant_id: str
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int,
+    tenant_id: str,
+    kb_ids: frozenset[str] | None,
 ) -> list[sqlite3.Row]:
     """① MATCH 主路：OR 语义，命中任意 token 即入选。
 
@@ -140,17 +145,29 @@ def _match_rows(
     match = to_match_query(query)
     if not match:
         return []
-    return conn.execute(
+    sql = (
         "select chunk_id, document_id from chunks_fts"
         " where chunks_fts match ?"
-        " and document_id in (select id from documents where tenant_id = ?)"
-        " order by rank limit ?",
-        (match, tenant_id, limit),
-    ).fetchall()
+        " and document_id in (select id from documents where tenant_id = ?"
+    )
+    params: list[object] = [match, tenant_id]
+    if kb_ids is not None:
+        if not kb_ids:
+            return []
+        marks = ",".join("?" * len(kb_ids))
+        sql += f" and kb_id in ({marks})"
+        params.extend(sorted(kb_ids))
+    sql += ") order by rank limit ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
 
 
 def _like_rows(
-    conn: sqlite3.Connection, query: str, limit: int, tenant_id: str
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int,
+    tenant_id: str,
+    kb_ids: frozenset[str] | None,
 ) -> list[sqlite3.Row]:
     """② LIKE 兜底：单字汉字（`泵`、`站`）不产生 bigram，MATCH 永远够不着。
 
@@ -161,17 +178,31 @@ def _like_rows(
     if not singles:
         return []
     clauses = " OR ".join(["content like ?"] * len(singles))
-    return conn.execute(
+    sql = (
         # S608 是误报：clauses 只拼「content like ?」占位符，值全部走参数绑定
         f"select chunk_id, document_id from chunks_fts where {clauses}"  # noqa: S608
-        " and document_id in (select id from documents where tenant_id = ?)"
-        " order by chunk_id limit ?",
-        [f"%{char}%" for char in singles] + [tenant_id, limit],
-    ).fetchall()
+        " and document_id in (select id from documents where tenant_id = ?"
+    )
+    params: list[object] = [f"%{char}%" for char in singles]
+    params.append(tenant_id)
+    if kb_ids is not None:
+        if not kb_ids:
+            return []
+        marks = ",".join("?" * len(kb_ids))
+        sql += f" and kb_id in ({marks})"
+        params.extend(sorted(kb_ids))
+    sql += ") order by chunk_id limit ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
 
 
 def search_fts(
-    conn: sqlite3.Connection, query: str, *, tenant_id: str, limit: int = 5
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    tenant_id: str,
+    limit: int = 5,
+    kb_ids: frozenset[str] | None = None,
 ) -> list[SearchHit]:
     """全文检索。查询串与索引串走同一个 `tokenizer`，否则命中 0 条且不报错。
 
@@ -193,14 +224,16 @@ def search_fts(
     # 入口闸门（S-V10）：索引 stale 时报错，不许走到下面返回空列表。
     # 与 `retrieve` 各放一次——只在一处放，另一条路就绕过了。
     ensure_index_fresh(conn)
-    rows = _match_rows(conn, query, limit, tenant_id)
+    rows = _match_rows(conn, query, limit, tenant_id, kb_ids)
     if not rows:
-        rows = _like_rows(conn, query, limit, tenant_id)
+        rows = _like_rows(conn, query, limit, tenant_id, kb_ids)
     hits: list[SearchHit] = []
     for row in rows:
         chunk_id = int(row["chunk_id"])
         content_row = conn.execute(
-            "select content, document_id from chunks where id = ?", (chunk_id,)
+            "select c.content, c.document_id, d.kb_id from chunks c"
+            " join documents d on d.id = c.document_id where c.id = ?",
+            (chunk_id,),
         ).fetchone()
         if content_row is None:
             # 全文行还在、正文块已删：正是 `[b2]` 幽灵全文，这里不替它遮掩。
@@ -210,6 +243,7 @@ def search_fts(
                 chunk_id=chunk_id,
                 document_id=str(content_row["document_id"]),
                 content=str(content_row["content"]),
+                kb_id=None if content_row["kb_id"] is None else str(content_row["kb_id"]),
             )
         )
     return hits

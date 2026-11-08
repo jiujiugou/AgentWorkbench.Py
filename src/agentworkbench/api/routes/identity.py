@@ -31,6 +31,7 @@ from agentworkbench.api.deps import Deps
 from agentworkbench.api.errors import not_found
 from agentworkbench.api.schemas import ApiModel, AuthUserDto
 from agentworkbench.core.errors import AppError, ErrorCode
+from agentworkbench.db.repositories import knowledge as knowledge_repo
 from agentworkbench.identity import credentials, service, store
 from agentworkbench.identity.models import Account
 
@@ -60,6 +61,7 @@ def _dto(account: Account) -> AuthUserDto:
         role=str(account.role),
         status=str(account.status),
         tenant_id=account.tenant_id,
+        level_rank=account.level_rank,
         must_change_password=account.must_change_password,
     )
 
@@ -214,6 +216,20 @@ def accept_invite(
                 now=datetime.now(UTC),
                 config=config,
             )
+            knowledge_repo.insert_admin_event(
+                conn,
+                actor_user_id=accepted.account.user_id,
+                tenant_id=accepted.account.tenant_id,
+                target_user_id=accepted.account.user_id,
+                action="user.accept_invite",
+                resource_kind="user",
+                resource_id=accepted.account.user_id,
+                old_value=None,
+                new_value=f"{accepted.account.role}:{accepted.account.level_rank}",
+                request_id=str(getattr(request.state, "request_id", "") or "") or None,
+                now=datetime.now(UTC),
+            )
+            conn.commit()
     except service.InviteUnusable:
         raise not_found("邀请不存在或已失效。") from None
     except service.EmailAlreadyTaken:

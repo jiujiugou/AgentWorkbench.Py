@@ -15,9 +15,11 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 from typing import cast
 
 from agentworkbench.core.documents import DocStatus, require_transition
+from agentworkbench.db.repositories import knowledge as knowledge_repo
 
 
 def create(
@@ -30,11 +32,18 @@ def create(
     sha256: str,
     size_bytes: int,
     now: str,
+    kb_id: str | None = None,
 ) -> None:
-    """建一条 `pending`。撞 `(tenant_id, sha256)` 唯一约束时抛 `IntegrityError`。"""
+    """建一条 `pending`。撞 `(tenant_id, kb_id, sha256)` 唯一约束时抛 `IntegrityError`。
+
+    `kb_id` 为空时兜底到默认公共库：旧测试与手工 SQL 不传，但新入口必须显式传。
+    兜底只发生在写入口，读侧仍要求可访问集合包含该 id。
+    """
+    target_kb = kb_id or knowledge_repo.ensure_default_kb(conn, tenant_id, now=datetime.now(UTC))
     conn.execute(
         "insert into documents(id, tenant_id, file_name, stored_path, sha256, size_bytes,"
-        " status, page_count, created_at, updated_at) values (?,?,?,?,?,?,?,?,?,?)",
+        " status, page_count, created_at, updated_at, kb_id)"
+        " values (?,?,?,?,?,?,?,?,?,?,?)",
         (
             doc_id,
             tenant_id,
@@ -46,35 +55,53 @@ def create(
             0,
             now,
             now,
+            target_kb,
         ),
     )
 
 
-def find_by_digest(conn: sqlite3.Connection, *, tenant_id: str, sha256: str) -> sqlite3.Row | None:
-    """快路径。真正的保证在唯一约束上——这里返回 `None` 不代表插得进去。"""
+def find_by_digest(
+    conn: sqlite3.Connection, *, tenant_id: str, sha256: str, kb_id: str | None = None
+) -> sqlite3.Row | None:
+    """快路径。真正的保证在唯一约束上——这里返回 `None` 不代表插得进去。
+
+    去重键按知识库：同一文件可以分别存在于公共库与私人库。不传 `kb_id` 时
+    只查默认公共库，保持旧调用方的行为。
+    """
+    target_kb = kb_id or knowledge_repo.ensure_default_kb(conn, tenant_id, now=datetime.now(UTC))
     return cast(
         sqlite3.Row | None,
         conn.execute(
-            "select * from documents where tenant_id = ? and sha256 = ?", (tenant_id, sha256)
+            "select * from documents where tenant_id = ? and kb_id = ? and sha256 = ?",
+            (tenant_id, target_kb, sha256),
         ).fetchone(),
     )
 
 
-def get(conn: sqlite3.Connection, doc_id: str, *, tenant_id: str) -> sqlite3.Row | None:
+def get(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    *,
+    tenant_id: str,
+    kb_ids: frozenset[str] | None = None,
+) -> sqlite3.Row | None:
     """按 id 取一份。**团队条件与 id 在同一条语句里**（`I-V2`）。
 
-    分成「先按 id 查、再判 tenant」两步也能对，但第二步漏写的那个调用点
-    不会报错——它只是把别人的文档返回出去。而 `tenant_id` 没有默认值，
-    漏传是 `TypeError`，在第一次调用时就炸。
-
+    `kb_ids` 非空时同时限制可访问知识库；路由必须传，测试/迁移可省略。
     `tenant_id` 是空串时不返回任何行（`where tenant_id = ''` 匹配不到）——
     这正是 AUTH-06 要的一侧：判不清就不给，而不是「没填就都给你」。
     """
+    sql = "select * from documents where id = ? and tenant_id = ?"
+    params: list[object] = [doc_id, tenant_id]
+    if kb_ids is not None:
+        if not kb_ids:
+            return None
+        marks = ",".join("?" * len(kb_ids))
+        sql += f" and kb_id in ({marks})"
+        params.extend(sorted(kb_ids))
     return cast(
         sqlite3.Row | None,
-        conn.execute(
-            "select * from documents where id = ? and tenant_id = ?", (doc_id, tenant_id)
-        ).fetchone(),
+        conn.execute(sql, params).fetchone(),
     )
 
 
@@ -156,7 +183,9 @@ def list_by_status(conn: sqlite3.Connection, statuses: list[DocStatus]) -> list[
     ).fetchall()
 
 
-def list_all(conn: sqlite3.Connection, *, tenant_id: str) -> list[sqlite3.Row]:
+def list_all(
+    conn: sqlite3.Connection, *, tenant_id: str, kb_ids: frozenset[str] | None = None
+) -> list[sqlite3.Row]:
     """列表页用。新的在前——刚传的文件要立刻看见。
 
     排序键只到 `created_at`（秒级），同秒内多条顺序不定；加上 `id` 让分页稳定，
@@ -164,44 +193,70 @@ def list_all(conn: sqlite3.Connection, *, tenant_id: str) -> list[sqlite3.Row]:
 
     **团队条件在 SQL 里，不做 Python 过滤**：后者要先把所有团队的行读进内存
     再丢掉，而「读过」在缓存、日志、未来的分页里都留得下痕迹（`I-V2`）。
+    `kb_ids` 非空时同时限制可访问知识库。
     """
-    return cast(
-        "list[sqlite3.Row]",
-        conn.execute(
-            "select * from documents where tenant_id = ? order by created_at desc, id desc",
-            (tenant_id,),
-        ).fetchall(),
-    )
+    sql = "select * from documents where tenant_id = ?"
+    params: list[object] = [tenant_id]
+    if kb_ids is not None:
+        if not kb_ids:
+            return []
+        marks = ",".join("?" * len(kb_ids))
+        sql += f" and kb_id in ({marks})"
+        params.extend(sorted(kb_ids))
+    sql += " order by created_at desc, id desc"
+    return cast("list[sqlite3.Row]", conn.execute(sql, params).fetchall())
 
 
-def list_pages(conn: sqlite3.Connection, doc_id: str, *, tenant_id: str) -> list[sqlite3.Row]:
+def list_pages(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    *,
+    tenant_id: str,
+    kb_ids: frozenset[str] | None = None,
+) -> list[sqlite3.Row]:
     """页文本，按页码升序。**没有 `cleaned_text` 列**：清理只在切块时做，不单独存。
 
     团队条件走 `documents` 的存在性：页表自己没有 tenant 列，也不该有——
     多一列就多一处可能与主表不一致的地方。
     """
-    return cast(
-        "list[sqlite3.Row]",
-        conn.execute(
-            "select p.page_no, p.raw_text from document_pages p"
-            " join documents d on d.id = p.document_id"
-            " where p.document_id = ? and d.tenant_id = ? order by p.page_no",
-            (doc_id, tenant_id),
-        ).fetchall(),
+    sql = (
+        "select p.page_no, p.raw_text from document_pages p"
+        " join documents d on d.id = p.document_id"
+        " where p.document_id = ? and d.tenant_id = ?"
     )
+    params: list[object] = [doc_id, tenant_id]
+    if kb_ids is not None:
+        if not kb_ids:
+            return []
+        marks = ",".join("?" * len(kb_ids))
+        sql += f" and d.kb_id in ({marks})"
+        params.extend(sorted(kb_ids))
+    sql += " order by p.page_no"
+    return cast("list[sqlite3.Row]", conn.execute(sql, params).fetchall())
 
 
-def list_chunks(conn: sqlite3.Connection, doc_id: str, *, tenant_id: str) -> list[sqlite3.Row]:
+def list_chunks(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    *,
+    tenant_id: str,
+    kb_ids: frozenset[str] | None = None,
+) -> list[sqlite3.Row]:
     """块，按 `seq` 升序。顺序即语义——切块质量就是靠"相邻两块读起来连不连"判断的。"""
-    return cast(
-        "list[sqlite3.Row]",
-        conn.execute(
-            "select c.seq, c.page_from, c.page_to, c.heading, c.content, c.char_count"
-            " from chunks c join documents d on d.id = c.document_id"
-            " where c.document_id = ? and d.tenant_id = ? order by c.seq",
-            (doc_id, tenant_id),
-        ).fetchall(),
+    sql = (
+        "select c.seq, c.page_from, c.page_to, c.heading, c.content, c.char_count"
+        " from chunks c join documents d on d.id = c.document_id"
+        " where c.document_id = ? and d.tenant_id = ?"
     )
+    params: list[object] = [doc_id, tenant_id]
+    if kb_ids is not None:
+        if not kb_ids:
+            return []
+        marks = ",".join("?" * len(kb_ids))
+        sql += f" and d.kb_id in ({marks})"
+        params.extend(sorted(kb_ids))
+    sql += " order by c.seq"
+    return cast("list[sqlite3.Row]", conn.execute(sql, params).fetchall())
 
 
 def delete_row(conn: sqlite3.Connection, doc_id: str) -> None:

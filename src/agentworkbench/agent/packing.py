@@ -40,6 +40,7 @@ def number_hits(hits: Sequence[RetrievalHit]) -> tuple[NumberedHit, ...]:
             page_to=hit.page_to,
             heading=hit.heading,
             vector_distance=hit.vector_distance,
+            kb_id=hit.kb_id,
         )
         for index, hit in enumerate(hits)
     )

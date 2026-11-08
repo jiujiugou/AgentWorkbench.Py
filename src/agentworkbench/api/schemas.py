@@ -46,6 +46,7 @@ class UserDto(ApiModel):
     role: str
     status: str
     tenant_id: str
+    level_rank: int = 1
 
 
 class AuthUserDto(UserDto):
@@ -72,6 +73,7 @@ class DocumentDto(ApiModel):
     chunk_count: int = 0
     vector_count: int = 0
     index_state: str = IndexState.PENDING
+    kb_id: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row, *, chunk_count: int, vector_count: int) -> DocumentDto:
@@ -89,6 +91,7 @@ class DocumentDto(ApiModel):
             chunk_count=chunk_count,
             vector_count=vector_count,
             index_state=str(describe_index_state(status, chunk_count, vector_count)),
+            kb_id=_opt_str(row["kb_id"]),
         )
 
 

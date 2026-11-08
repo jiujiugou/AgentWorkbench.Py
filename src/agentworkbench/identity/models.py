@@ -24,8 +24,12 @@ from datetime import datetime
 from enum import StrEnum
 
 from agentworkbench.core.identity import Owner
+from agentworkbench.core.knowledge import DEFAULT_LEVEL_RANK, MAX_LEVEL_RANK, MIN_LEVEL_RANK
 
 __all__ = [
+    "DEFAULT_LEVEL_RANK",
+    "MAX_LEVEL_RANK",
+    "MIN_LEVEL_RANK",
     "ROLE_RANK",
     "Account",
     "AccountStatus",
@@ -112,6 +116,10 @@ class ReasonCode(StrEnum):
     **刻意不与 `role_insufficient` 合并**：运维看到前者会去找该团队的管理员，
     而这件事找团队管理员没有用——他在自己的团队里权限再高也改不了全平台配置。
     合并之后，记录里所有 403 长得一样，而处置方式相反的两种拒绝并成了一种。"""
+    LEVEL_INSUFFICIENT = "level_insufficient"
+    """「你的账号等级不够」：内容读侧按 404、管理动作按 403，对外不泄露原因。"""
+    KB_NOT_VISIBLE = "kb_not_visible"
+    """「这个知识库对你不可见」：与不存在的知识库/文档共用 404。"""
     PASSWORD_CHANGE_REQUIRED = "password_change_required"  # noqa: S105 —— 原因码，不是口令
     """「你还没改初始口令」。它也是 403，但处置动作是改密，不是找人授权。"""
     BOOTSTRAP_CLOSED = "bootstrap_closed"
@@ -170,6 +178,7 @@ class Account:
     failed_attempts: int = 0
     is_platform_admin: bool = False
     must_change_password: bool = False
+    level_rank: int = DEFAULT_LEVEL_RANK
 
     @property
     def normalized_email(self) -> str:
@@ -228,6 +237,7 @@ class Principal:
     lockout_until: datetime | None = None
     is_platform_admin: bool = False
     must_change_password: bool = False
+    level_rank: int = DEFAULT_LEVEL_RANK
 
 
 @dataclass(frozen=True)

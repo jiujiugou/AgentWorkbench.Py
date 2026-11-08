@@ -82,6 +82,7 @@ def snapshot_citations(
             check_first=citation.first,
             check_second=citation.second,
             coverage=citation.coverage,
+            kb_id=hit.kb_id,
         )
         previous = merged.get(citation.evidence_no)
         merged[citation.evidence_no] = (

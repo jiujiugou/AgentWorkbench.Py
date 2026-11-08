@@ -782,8 +782,14 @@ req = "REQ-16"
 invariant = "对"
 claim = "假模型客户端阻塞中发停止 → 终态 cancelled，且「已发出未返回」那一步在库里"
 negative = "把「收到请求」直接写成终态 → 步骤少一条 → 红"
-status = "partial"
-remaining = "写入口的两段写已就绪，并能验「停止落在等返回那一段」：步骤行在调用发出前就写下去，run 收口后迟到的结果一律被 close_step 丢弃（output 保持 NULL），这条已全绿。仍差的是一整条链路——runner.ask 是同步函数、没有取消点，run 也没有 stop 语义；要取消信号能传到阻塞中的客户端调用，才能造「发停止 → 终态 cancelled 且那一步在库里」。C# 的依据（§1.5 第三条）：hub 补发的终态是界面，不是库里那一行"
+status = "pass"
+tests = [
+    "tests/invariants/test_runs_endpoint.py::test_cancel_closes_the_inflight_run_and_keeps_the_unanswered_step",
+    "tests/invariants/test_runs_endpoint.py::test_cancel_without_run_id_targets_the_active_run",
+    "tests/invariants/test_runs_endpoint.py::test_cancel_after_terminal_does_not_rewrite_the_run",
+    "tests/invariants/test_recorder.py::test_step_results_arriving_after_cancel_are_discarded",
+]
+evidence = "2026-11-05。新增 `POST /api/runs/cancel`：停止请求与作答线程分离，模型调用阻塞中也能把 run 收口成 `cancelled`。步骤行在调用发出前已经写下去，收口后迟到的结果一律被 `close_step` 丢弃（output 保持 NULL）；已经有完整 assistant 步的 run 不收口，避免 `cancelled` 里挂着一条成功生成。已验证：阻塞中取消 → 终态 cancelled 且 inFlight 步骤在；无 runId 时按会话/当前用户定位；已成功终态不被改写；他人 run 与不存在同形 404。"
 
 [[tool.agentworkbench.verification]]
 id = "A-V7"
@@ -1929,6 +1935,85 @@ tests = [
     "tests/acceptance/test_p0_audit_entries.py::test_every_producing_route_writes_exactly_one_run",
 ]
 
+# ── REQ-24 / REQ-25：知识库等级可见性（ADR 0011） ──
+# 判据先登记、测试后补：实现与测试已落地，状态才从 partial 转 pass。
+# 每条都必须有负控——尤其「管理员没有内容后门」与「降级后历史只过滤来源、正文保留」。
+
+[[tool.agentworkbench.verification]]
+id = "I-V20"
+req = "REQ-25"
+invariant = "级"
+claim = "账号等级独立于角色；管理员不能改自己的等级、不能授予高于自己的等级、不能重置高于自己等级账号的密码"
+negative = "管理员自升成功；给账号设置高于自己的等级成功；重置更高等级账号密码成功；等级变更不清会话缓存 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_knowledge_permissions.py::test_admin_cannot_raise_their_own_level_or_grant_above_their_own",
+    "tests/invariants/test_knowledge_permissions.py::test_admin_cannot_manage_an_account_above_their_level",
+]
+
+[[tool.agentworkbench.verification]]
+id = "I-V21"
+req = "REQ-24 / REQ-25"
+invariant = "级"
+claim = "低等级管理员只能看到私人知识库元数据，看不到文档列表、正文、引用与轨迹证据；管理员无内容后门"
+negative = "admin 角色直接获得私人库文档/引用/证据；平台管理员靠 is_platform_admin 绕过等级 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_knowledge_permissions.py::test_low_level_admin_has_no_content_backdoor",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-20"
+req = "REQ-24"
+claim = "文档继承知识库可见性：公共库全员可读；私人库低于 min_level_rank 的账号在列表、详情、检索中均不可见"
+negative = "低等级账号直接按 id 取私人库文档仍返回 200；私人库内容出现在检索命中 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_knowledge_permissions.py::test_low_level_admin_has_no_content_backdoor",
+    "tests/invariants/test_knowledge_permissions.py::test_public_and_private_kbs_have_different_accessible_sets",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-21"
+req = "REQ-24"
+claim = "同一文件可分别存在于不同知识库；去重键按 (tenant_id, kb_id, sha256)，删私人库副本不影响公共库副本"
+negative = "第二个知识库上传同文件被旧 tenant+sha256 约束拒绝；删除一份导致另一份的文件或索引消失 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_knowledge_permissions.py::test_same_file_can_exist_in_two_kbs_but_not_twice_in_one",
+]
+
+[[tool.agentworkbench.verification]]
+id = "V-22"
+req = "REQ-24"
+claim = "存量文档与引用/证据快照迁入默认公共知识库；迁移后低等级用户仍能读原有公共资料"
+negative = "迁移后存在 kb_id 为空的文档；默认公共库缺失；旧引用因 kb_id 为空被误判为不可访问 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_knowledge_permissions.py::test_ensure_knowledge_schema_backfills_legacy_rows",
+]
+
+[[tool.agentworkbench.verification]]
+id = "G16"
+req = "REQ-24"
+claim = "检索的词面路与向量路都按 team + accessible_kb_ids 过滤；低等级账号只命中可见知识库"
+negative = "只过滤融合后的 top-k；无命中时回退到不过滤；admin 角色获得额外命中 → 不通过"
+status = "pass"
+tests = [
+    "tests/invariants/test_knowledge_permissions.py::test_retrieval_filters_text_and_vector_routes_by_accessible_kb",
+]
+
+[[tool.agentworkbench.verification]]
+id = "C-V14"
+req = "REQ-24"
+invariant = "隔"
+claim = "历史引用与轨迹证据按当前等级过滤：不可访问时只显示占位，不显示文件名/片段/页码；答案正文保留"
+negative = "降级后仍能看到私人库文件名或片段；把引用整条删除；把正文一起删掉；恢复等级后引用不再出现 → 不通过"
+status = "pass"
+tests = [
+    "tests/acceptance/test_knowledge_permissions_acceptance.py::test_history_citation_and_trace_are_filtered_by_current_level",
+]
+
 # ─────────────────────────────────────────────────────────────
 # 状态机登记表：每个状态机叫什么、状态集、真源在哪。
 # **合法迁移不在这里抄第二份**——两份迁移表必然漂移，而且漂移的表现是
@@ -1977,6 +2062,13 @@ owner = "F7"
 states = "general, knowledge"
 source = "agentworkbench.db.repositories.conversations"
 note = "不是可迁移状态机，是创建时二选一的类型状态集：合法迁移为空集，切换模式必须新建会话。登记在这里是为了让第三种会话类型出现时必须经过闸门审查，而不是悄悄加一个分支。"
+
+[[tool.agentworkbench.state_machine]]
+name = "knowledge_base_visibility"
+owner = "F2"
+states = "public, private"
+source = "agentworkbench.core.knowledge"
+note = "知识库的可见性不是文档级 ACL：public 全员可读，private 只对达到 min_level_rank 的账号可读。public ↔ private 可迁移，但只有角色与等级都够的管理员能改；文档继承知识库，不单独设状态。迁移白名单在 core.knowledge。"
 
 [[tool.agentworkbench.component]]
 capability = "切块"

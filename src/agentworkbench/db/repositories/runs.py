@@ -71,6 +71,61 @@ def get_status(conn: sqlite3.Connection, run_id: str) -> str | None:
     return None if row is None else str(row["status"])
 
 
+def find_running_for_owner(
+    conn: sqlite3.Connection,
+    owner: Owner,
+    *,
+    conversation_id: str | None = None,
+) -> str | None:
+    """找当前用户最新的 `running` run，供“停止当前作答”使用。
+
+    `conversation_id` 存在时按会话过滤：多标签页同时提问时，停止只收口
+    当前这条会话里的那次运行，不去碰另一个标签页。没有会话 id（新会话的
+    首问还没把响应交回来）时退回“该用户最新的 running”——界面同一时刻
+    只允许一次生成，这是它成立的边界。
+    """
+    if conversation_id is None:
+        row = conn.execute(
+            "select id from agent_runs where tenant_id = ? and user_id = ? and status = ?"
+            " order by started_at desc, rowid desc limit 1",
+            (owner.tenant_id, owner.user_id, RunStatus.RUNNING.value),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "select r.id from agent_runs r join messages m on m.run_id = r.id"
+            " where r.tenant_id = ? and r.user_id = ? and r.status = ? and m.conversation_id = ?"
+            " order by r.started_at desc, r.rowid desc limit 1",
+            (owner.tenant_id, owner.user_id, RunStatus.RUNNING.value, conversation_id),
+        ).fetchone()
+    return None if row is None else str(row["id"])
+
+
+def cancel_run(conn: sqlite3.Connection, *, run_id: str, finished_at: str) -> bool:
+    """把仍可停止的运行收口成 `cancelled`。返回是否真的改动了行。
+
+    **“已生成”的 run 不允许再取消。** 条件里排除已经有 `output` 的 assistant
+    步：模型已经返回、只是后处理还没走完时，停止请求到达得太晚，让它正常
+    落地比把一条“取消了的运行”里留一条完整成功的生成步更诚实（A-V3）。
+    `not exists` 与 `update` 在同一条语句里，挡住“检查后完成、收口前写入”
+    的竞态。
+    """
+    cursor = conn.execute(
+        "update agent_runs set status = ?, reason = ?, finished_at = ?"
+        " where id = ? and status = ? and not exists ("
+        "   select 1 from agent_steps where run_id = ? and kind = ? and output is not null)",
+        (
+            RunStatus.CANCELLED.value,
+            None,
+            finished_at,
+            run_id,
+            RunStatus.RUNNING.value,
+            run_id,
+            StepKind.ASSISTANT.value,
+        ),
+    )
+    return cursor.rowcount > 0
+
+
 def close_run(
     conn: sqlite3.Connection,
     *,

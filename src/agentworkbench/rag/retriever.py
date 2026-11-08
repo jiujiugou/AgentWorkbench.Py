@@ -68,6 +68,7 @@ class RetrievalHit:
     heading: str | None
     rrf_score: float
     vector_distance: float | None
+    kb_id: str | None = None
 
 
 def retrieve(
@@ -76,6 +77,7 @@ def retrieve(
     *,
     embedder: QueryEmbedder | None,
     tenant_id: str,
+    kb_ids: frozenset[str] | None = None,
     top_k: int = 5,
     candidate_k: int = CANDIDATE_K,
 ) -> list[RetrievalHit]:
@@ -120,9 +122,9 @@ def retrieve(
                 entry["distance"] = vector_distance
 
     # 全文路（FTS5/BM25 rank 排序）；超长问句截到 24 个 bigram
-    text_hits = search_fts(conn, _capped_query(query), tenant_id=tenant_id, limit=k)
+    text_hits = search_fts(conn, _capped_query(query), tenant_id=tenant_id, limit=k, kb_ids=kb_ids)
     for rank, hit in enumerate(text_hits):
-        meta = _meta_of(conn, hit.chunk_id, hit.document_id, hit.content, tenant_id)
+        meta = _meta_of(conn, hit.chunk_id, hit.document_id, hit.content, tenant_id, kb_ids)
         if meta is None:
             continue
         _accumulate(hit.chunk_id, 1.0 / (RRF_K + rank + 1), None, meta)
@@ -135,7 +137,7 @@ def retrieve(
     for rank, (chunk_id, distance) in enumerate(
         _vector_search(conn, embedding, k) if embedding is not None else []
     ):
-        meta = _meta_of(conn, int(chunk_id), None, None, tenant_id)
+        meta = _meta_of(conn, int(chunk_id), None, None, tenant_id, kb_ids)
         if meta is None:
             # 这条块属于别的团队（或文档已删）。**不累加**：融合分只对
             # 本团队的候选有意义，给它一个分数会让它挤掉本团队的名额。
@@ -157,6 +159,7 @@ def retrieve(
                 heading=cast("str | None", e["heading"]),
                 rrf_score=cast(float, e["rrf"]),
                 vector_distance=cast("float | None", e["distance"]),
+                kb_id=cast("str | None", e.get("kb_id")),
             )
         )
     return hits
@@ -194,6 +197,7 @@ def _meta_of(
     document_id: str | None,
     content: str | None,
     tenant_id: str,
+    kb_ids: frozenset[str] | None = None,
 ) -> dict[str, object] | None:
     """补齐块元数据。全文路已带 content，向量路从 chunks 表取。
 
@@ -204,16 +208,26 @@ def _meta_of(
     过滤写进 join 条件，不是取回来再判：后者要先把别人的正文读进内存，
     而「读过」这件事在缓存与日志里留得下痕迹。
     """
+
+    def _scope(sql: str, params: list[object]) -> tuple[str, list[object]]:
+        if kb_ids is None:
+            return sql, params
+        if not kb_ids:
+            return sql + " and 1 = 0", params
+        marks = ",".join("?" * len(kb_ids))
+        return sql + f" and d.kb_id in ({marks})", [*params, *sorted(kb_ids)]
+
     if document_id is not None and content is not None:
-        row = conn.execute(
+        sql = (
             # chunks_vec 是 PascalCase 列名（C# 迁移遗留）：SQLite 不区分大小写
             # 但区分下划线，page_from ≠ PageFrom——写错不报 schema 错，报 no such column
-            "select v.Seq, v.PageFrom, v.PageTo, v.Heading, d.file_name"
+            "select v.Seq, v.PageFrom, v.PageTo, v.Heading, d.file_name, d.kb_id"
             " from chunks_vec v"
             " join documents d on d.id = ? and d.tenant_id = ?"
-            " where v.ChunkId = ?",
-            (document_id, tenant_id, chunk_id),
-        ).fetchone()
+            " where v.ChunkId = ?"
+        )
+        sql, params = _scope(sql, [document_id, tenant_id, chunk_id])
+        row = conn.execute(sql, params).fetchone()
         if row is None:
             return None
         return {
@@ -224,14 +238,16 @@ def _meta_of(
             "page_from": row["PageFrom"] if row else 1,
             "page_to": row["PageTo"] if row else 1,
             "heading": row["Heading"] if row else None,
+            "kb_id": row["kb_id"],
         }
-    row = conn.execute(
+    sql = (
         "select v.Seq, v.PageFrom, v.PageTo, v.Heading, v.DocumentId, c.content,"
-        " d.file_name from chunks_vec v join chunks c on c.id = v.ChunkId"
+        " d.file_name, d.kb_id from chunks_vec v join chunks c on c.id = v.ChunkId"
         " join documents d on d.id = v.DocumentId and d.tenant_id = ?"
-        " where v.ChunkId = ?",
-        (tenant_id, chunk_id),
-    ).fetchone()
+        " where v.ChunkId = ?"
+    )
+    sql, params = _scope(sql, [tenant_id, chunk_id])
+    row = conn.execute(sql, params).fetchone()
     if row is None:
         # 两种可能：块属于别的团队（绝不返回），或者 vec 行在、正文块已删
         # （[c2] 类幽灵）。两者都不该进候选——前者是越权，后者是噪声。
@@ -245,4 +261,5 @@ def _meta_of(
         "page_from": row["PageFrom"],
         "page_to": row["PageTo"],
         "heading": row["Heading"],
+        "kb_id": row["kb_id"],
     }

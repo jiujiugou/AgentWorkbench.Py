@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Final, cast
 
 from agentworkbench.core.identity import Owner
+from agentworkbench.core.knowledge import can_read
 from agentworkbench.identity.models import (
     ROLE_RANK,
     Account,
@@ -55,6 +56,9 @@ __all__ = [
     "judge_access",
     "judge_admin",
     "judge_invite",
+    "judge_kb_management",
+    "judge_kb_read",
+    "judge_level_assignment",
     "judge_management",
     "judge_platform",
     "login_block_reason",
@@ -186,6 +190,7 @@ def judge_access(
         lockout_until=account.lockout_until,
         is_platform_admin=account.is_platform_admin,
         must_change_password=account.must_change_password,
+        level_rank=account.level_rank,
     )
 
     # ② 账户：只判 status。停止的账户连同已签发会话一起失效（那是「踢」的本意）；
@@ -288,7 +293,53 @@ def judge_platform(*, actor: Principal) -> Decision:
     return Decision(outcome=Outcome.ALLOW, principal=actor)
 
 
-def judge_management(*, actor: Principal, target_user_id: str, target_role: Role) -> Decision:
+def judge_kb_read(*, actor: Principal, visibility: str, min_level_rank: int | None) -> Decision:
+    """知识库读权限。**不可见与不存在共用 404**。
+
+    `public` 全员可读；`private` 要求 `actor.level_rank >= min_level_rank`。
+    管理员没有内容后门：这个函数不读 `role`，所以低等级管理员与普通成员
+    走同一条判定。
+    """
+    if can_read(actor.level_rank, visibility, min_level_rank):
+        return Decision(outcome=Outcome.ALLOW, principal=actor)
+    return _deny(Outcome.NOT_FOUND, ReasonCode.KB_NOT_VISIBLE, actor)
+
+
+def judge_kb_management(
+    *, actor: Principal, visibility: str, min_level_rank: int | None
+) -> Decision:
+    """知识库元数据/内容写权限：**管理员角色 + 知识库对本人可见**。
+
+    用 403 而不是 404：这是按动作调的接口，动作本身公开存在。低等级管理员
+    能知道知识库存在（元数据可见），但不能改它。
+    """
+    if actor.role is not Role.ADMIN:
+        return _deny(Outcome.FORBIDDEN, ReasonCode.ROLE_INSUFFICIENT, actor)
+    if not can_read(actor.level_rank, visibility, min_level_rank):
+        return _deny(Outcome.FORBIDDEN, ReasonCode.LEVEL_INSUFFICIENT, actor)
+    return Decision(outcome=Outcome.ALLOW, principal=actor)
+
+
+def judge_level_assignment(
+    *, actor: Principal, target_user_id: str | None, target_level_rank: int
+) -> Decision:
+    """管理员设置等级的上限：不能改自己，不能授予高于自己的等级。
+
+    目标为 `None` 表示直接建号（还没有账号）；建号同样受上限约束，否则
+    「不能授予高于自己」只要走建号路径就绕过去了。
+    """
+    if actor.role is not Role.ADMIN:
+        return _deny(Outcome.FORBIDDEN, ReasonCode.ROLE_INSUFFICIENT, actor)
+    if target_user_id is not None and target_user_id == actor.owner.user_id:
+        return _deny(Outcome.FORBIDDEN, ReasonCode.LEVEL_INSUFFICIENT, actor)
+    if target_level_rank > actor.level_rank:
+        return _deny(Outcome.FORBIDDEN, ReasonCode.LEVEL_INSUFFICIENT, actor)
+    return Decision(outcome=Outcome.ALLOW, principal=actor)
+
+
+def judge_management(
+    *, actor: Principal, target_user_id: str, target_role: Role, target_level_rank: int = 1
+) -> Decision:
     """管理动作（停用 / 恢复 / 改角色 / 删成员）的边界。**全域唯一用 403 的地方。**
 
     三条规则，缺一条都有真实后果：
@@ -303,6 +354,8 @@ def judge_management(*, actor: Principal, target_user_id: str, target_role: Role
        另一个管理员——如果这是唯一的管理员，系统就再也进不去了。
     3. **目标角色高于自己 → 403。** 不判这一条，管理员可以造一个比自己高的角色，
        再用它回来操作自己——「不得高于自己」只有在目标角色上也判才算数。
+    4. **目标等级高于自己 → 403。** 否则低等级管理员可以重置高等级账号的密码，
+       「管理员不能看私人库」就只剩界面隐藏。
     """
     if actor.role is not Role.ADMIN:
         return _deny(Outcome.FORBIDDEN, ReasonCode.ROLE_INSUFFICIENT, actor)
@@ -310,6 +363,8 @@ def judge_management(*, actor: Principal, target_user_id: str, target_role: Role
         return _deny(Outcome.FORBIDDEN, ReasonCode.ROLE_INSUFFICIENT, actor)
     if ROLE_RANK[target_role] > ROLE_RANK[actor.role]:
         return _deny(Outcome.FORBIDDEN, ReasonCode.ROLE_INSUFFICIENT, actor)
+    if target_level_rank > actor.level_rank:
+        return _deny(Outcome.FORBIDDEN, ReasonCode.LEVEL_INSUFFICIENT, actor)
     return Decision(outcome=Outcome.ALLOW, principal=actor)
 
 

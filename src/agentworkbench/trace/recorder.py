@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from agentworkbench.core.clock import elapsed_ms, monotonic, utc_now
 from agentworkbench.core.errors import AppError, ErrorCode
+from agentworkbench.core.identity import Owner
 from agentworkbench.core.runs import (
     REQUIRES_REASON,
     IllegalTransition,
@@ -78,6 +79,48 @@ def describe_error(exc: BaseException) -> str:
     不写 traceback：步骤表是给人扫一眼的，栈在日志里。
     """
     return f"{type(exc).__name__}: {exc}"
+
+
+def cancel_run(
+    conn: sqlite3.Connection,
+    owner: Owner,
+    run_id: str,
+    *,
+    now: Callable[[], str] = utc_now,
+) -> RunStatus | None:
+    """从**另一个请求**收口一次仍在运行的作答（REQ-16）。
+
+    停止请求和作答不在同一个执行体里：作答线程可能正阻塞在模型调用中，
+    这里只负责把 run 从 `running` 收口成 `cancelled`。已经在飞的步骤不删——
+    它的 `output` 仍是 NULL，回放时显示成「已发出未返回」，正是“实际停在哪”
+    的证据；迟到的结果由 `close_step` 的 `exists` 守卫丢弃。
+
+    已经生成出正文的 run 不收口（仓储里的 `not exists` 条件）：那时停止
+    来得太晚，让它正常落地，避免 `cancelled` 里挂着一个完整成功的生成步。
+
+    返回收口后的状态；`None` = 这条 run 不存在或不属于调用者。已经处于
+    终态的 run 原样返回，不覆盖（A-V4）。
+    """
+    row = runs_repo.get_for_owner(conn, owner, run_id)
+    if row is None:
+        return None
+    current = RunStatus(str(row["status"]))
+    if current is not RunStatus.RUNNING:
+        return current
+
+    require_transition(current, RunStatus.CANCELLED)
+    try:
+        written = runs_repo.cancel_run(conn, run_id=run_id, finished_at=now())
+        conn.commit()
+    except sqlite3.Error as exc:
+        raise RecordingFailed(f"停止收口写不进去：{exc}") from exc
+
+    if written:
+        return RunStatus.CANCELLED
+    # 没写进去有两种：并发方已经收口，或模型刚好返回、assistant 步已完整。
+    # 后者按“停止太晚”处理，返回仓储里的真实状态，让调用方不要假装已取消。
+    raw = runs_repo.get_status(conn, run_id)
+    return None if raw is None else RunStatus(raw)
 
 
 class Recorder:

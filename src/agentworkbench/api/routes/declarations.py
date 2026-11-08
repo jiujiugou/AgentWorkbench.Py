@@ -45,6 +45,10 @@ NOT_PRODUCING: dict[tuple[str, str], str] = {
     ("GET", "/api/documents/{doc_id}"): "读单份元数据：只查 documents 一行，不触发执行",
     ("GET", "/api/documents/{doc_id}/pages"): "读页原文：只查 document_pages，不触发执行",
     ("GET", "/api/documents/{doc_id}/chunks"): "读块，供界面展示切块结果",
+    (
+        "GET",
+        "/api/documents/{doc_id}/file",
+    ): "download original: read one stored file with the same tenant/KB filter as content; no run",
     ("POST", "/api/documents/{doc_id}/reparse"): "重解析：产物是 chunks 的新版本，"
     "失败落在 documents.error_code 上（F2 自己的记录），不是一次作答",
     ("DELETE", "/api/documents/{doc_id}"): "删除：产物是这行不存在了，没有可回放的执行过程",
@@ -59,6 +63,8 @@ NOT_PRODUCING: dict[tuple[str, str], str] = {
     "它是 run 的读取端，不是另一次作答",
     ("GET", "/api/runs/{run_id}"): "读一次运行的状态与已落库结果：查 agent_runs 与 messages 那行"
     "占位/正文，不触发执行——状态查询不是新一轮作答（REQ-18）",
+    ("POST", "/api/runs/cancel"): "停止一次仍在运行的作答：只把 run 收口成 cancelled，"
+    "不启动新的作答、不产生新的 run；迟到的模型结果由 close_step 丢弃（REQ-16）。",
     ("GET", "/api/settings/providers"): "读供应商配置列表：白名单 DTO，不触发模型调用",
     ("POST", "/api/settings/providers"): "新建供应商配置：落 providers 一行（api_key 加密后落库），"
     "配置是读和写，不是一次作答",
@@ -105,13 +111,35 @@ NOT_PRODUCING: dict[tuple[str, str], str] = {
     "不触发任何执行；改密不是一次作答",
     ("POST", "/api/auth/invites/{token}"): "接受邀请建号：写 users 与 invites 两行，"
     "邀请令牌本身就是凭证，与作答无关",
+    ("GET", "/api/knowledge-bases"): "知识库元数据：按团队/等级过滤，不读文档内容",
+    ("POST", "/api/knowledge-bases"): "建知识库：写 knowledge_bases 一行，不是一次作答",
+    ("PATCH", "/api/knowledge-bases/{kb_id}"): "改知识库元数据/可见性：一次 UPDATE，不是一次作答",
+    (
+        "POST",
+        "/api/knowledge-bases/{kb_id}/archive",
+    ): "archive KB: soft-state update; keeps documents/index/files, no run",
+    ("POST", "/api/knowledge-bases/{kb_id}/unarchive"): "unarchive KB: soft-state update; no run",
+    ("POST", "/api/members"): "直接建号：写 users 一行，不是一次作答",
+    (
+        "POST",
+        "/api/members/{user_id}/reset-password",
+    ): "管理员重置口令：换哈希并吊销票据，不是一次作答",
     ("GET", "/api/members"): "读成员列表：按团队查 users，只读",
     ("POST", "/api/members/invites"): "发邀请：写 invites 一行。它是账号的入口，"
     "不是一次作答——被邀请的人此时还不存在",
+    ("GET", "/api/members/invites"): "list pending invites: tenant-scoped read; no execution",
+    (
+        "DELETE",
+        "/api/members/invites/{invite_id}",
+    ): "revoke invite: one soft-state UPDATE; no execution",
     ("PATCH", "/api/members/{user_id}"): "改角色：一次 UPDATE，角色下个请求生效",
     ("POST", "/api/members/{user_id}/disable"): "停用成员：置 status 并吊销全部票据，"
     "两次 UPDATE 同一事务，没有执行过程",
     ("POST", "/api/members/{user_id}/enable"): "恢复成员：一次 UPDATE，不碰锁定列",
+    (
+        "GET",
+        "/api/admin/events",
+    ): "read admin audit: tenant-scoped admin_events query; no execution",
 }
 
 ABSENT: dict[tuple[str, str], str] = {

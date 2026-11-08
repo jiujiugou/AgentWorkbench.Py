@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
-from typing import Final
+from typing import Final, cast
 from uuid import uuid4
 
 from agentworkbench.identity.models import (
@@ -67,6 +67,7 @@ __all__ = [
     "refresh_ticket_epoch",
     "revoke_ticket",
     "revoke_user_tickets",
+    "set_level",
     "set_lockout",
     "set_must_change_password",
     "set_password_hash",
@@ -126,6 +127,7 @@ def _account(row: sqlite3.Row) -> Account:
         failed_attempts=int(row["failed_attempts"]),
         is_platform_admin=bool(row["is_platform_admin"]),
         must_change_password=bool(row["must_change_password"]),
+        level_rank=int(row["level_rank"]),
     )
 
 
@@ -213,6 +215,7 @@ def insert_user(
     now: datetime,
     is_platform_admin: bool = False,
     must_change_password: bool = False,
+    level_rank: int = 1,
 ) -> str:
     """建号。`credential_epoch` 从 1 起——0 与「没有版本」不可区分。
 
@@ -230,8 +233,8 @@ def insert_user(
         "insert into users"
         " (id, tenant_id, email, password_hash, role, status, credential_epoch,"
         "  lockout_until, failed_attempts, is_platform_admin, must_change_password,"
-        "  created_at, updated_at)"
-        " values (?, ?, ?, ?, ?, 'active', 1, null, 0, ?, ?, ?, ?)",
+        "  level_rank, created_at, updated_at)"
+        " values (?, ?, ?, ?, ?, 'active', 1, null, 0, ?, ?, ?, ?, ?)",
         (
             user_id,
             tenant_id,
@@ -240,6 +243,7 @@ def insert_user(
             str(role),
             1 if is_platform_admin else 0,
             1 if must_change_password else 0,
+            level_rank,
             moment,
             moment,
         ),
@@ -254,8 +258,8 @@ def get_user(conn: sqlite3.Connection, user_id: str) -> Account | None:
     """
     row = conn.execute(
         "select id, tenant_id, email, role, status, credential_epoch,"
-        " lockout_until, failed_attempts, is_platform_admin, must_change_password"
-        " from users where id = ?",
+        " lockout_until, failed_attempts, is_platform_admin, must_change_password,"
+        " level_rank from users where id = ?",
         (user_id,),
     ).fetchone()
     return None if row is None else _account(row)
@@ -265,8 +269,8 @@ def get_user_by_email(conn: sqlite3.Connection, email: str) -> Account | None:
     """登录用。邮箱全局唯一（见 `ux_users_email`），所以这里不需要团队上下文。"""
     row = conn.execute(
         "select id, tenant_id, email, role, status, credential_epoch,"
-        " lockout_until, failed_attempts, is_platform_admin, must_change_password from users"
-        " where email = ? collate nocase",
+        " lockout_until, failed_attempts, is_platform_admin, must_change_password,"
+        " level_rank from users where email = ? collate nocase",
         (_normalize_email(email),),
     ).fetchone()
     return None if row is None else _account(row)
@@ -276,8 +280,8 @@ def list_users(conn: sqlite3.Connection, tenant_id: str) -> list[Account]:
     """成员列表。团队条件在 SQL 里，不做 Python 过滤。"""
     rows = conn.execute(
         "select id, tenant_id, email, role, status, credential_epoch,"
-        " lockout_until, failed_attempts, is_platform_admin, must_change_password from users"
-        " where tenant_id = ? order by created_at, id",
+        " lockout_until, failed_attempts, is_platform_admin, must_change_password,"
+        " level_rank from users where tenant_id = ? order by created_at, id",
         (tenant_id,),
     ).fetchall()
     return [_account(row) for row in rows]
@@ -357,6 +361,23 @@ def set_role(
     cursor = conn.execute(
         "update users set role = ?, updated_at = ? where id = ? and role = ?",
         (str(target), stamp(now), user_id, str(expected)),
+    )
+    return cursor.rowcount == 1
+
+
+def set_level(
+    conn: sqlite3.Connection,
+    user_id: str,
+    *,
+    expected: int,
+    target: int,
+    now: datetime,
+) -> bool:
+    """改等级。**带 expected 的 CAS**：并发后台管理员各自提交时，后到的不能
+    静默覆盖前一条。等级变更不需要吊销票据，但调用方必须清会话缓存。"""
+    cursor = conn.execute(
+        "update users set level_rank = ?, updated_at = ? where id = ? and level_rank = ?",
+        (target, stamp(now), user_id, expected),
     )
     return cursor.rowcount == 1
 
@@ -531,6 +552,46 @@ def get_invite_by_hash(conn: sqlite3.Connection, token_hash: str) -> Invite | No
         (token_hash,),
     ).fetchone()
     return None if row is None else _invite(row)
+
+
+def get_invite(conn: sqlite3.Connection, invite_id: str, *, tenant_id: str) -> Invite | None:
+    row = conn.execute(
+        "select id, tenant_id, email, role, expires_at, accepted_at from invites"
+        " where id = ? and tenant_id = ?",
+        (invite_id, tenant_id),
+    ).fetchone()
+    return None if row is None else _invite(row)
+
+
+def list_pending_invites(
+    conn: sqlite3.Connection, *, tenant_id: str, now: datetime
+) -> list[sqlite3.Row]:
+    """????????????????????? token_hash?"""
+    return cast(
+        "list[sqlite3.Row]",
+        conn.execute(
+            "select id, email, role, expires_at, created_at from invites"
+            " where tenant_id = ? and accepted_at is null and expires_at > ?"
+            " order by created_at desc, id desc",
+            (tenant_id, stamp(now)),
+        ).fetchall(),
+    )
+
+
+def revoke_invite(
+    conn: sqlite3.Connection, invite_id: str, *, tenant_id: str, now: datetime
+) -> bool:
+    """?????????????
+
+    ?? `accepted_at` ????????????????????????
+    ??????????????????????????? admin_events?
+    """
+    cursor = conn.execute(
+        "update invites set accepted_at = ?, accepted_by = null"
+        " where id = ? and tenant_id = ? and accepted_at is null",
+        (stamp(now), invite_id, tenant_id),
+    )
+    return cursor.rowcount == 1
 
 
 def accept_invite(
