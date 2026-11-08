@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ChatLineSquare,
@@ -8,10 +8,11 @@ import {
   Plus,
   Setting,
   SwitchButton,
+  UserFilled,
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import ConversationList from '@/components/ConversationList.vue'
-import { logout } from '@/api/auth'
+import { cachedUser, logout, type AuthUser } from '@/api/auth'
 import { QUICK_STARTS } from '@/suggestions'
 import { useAgentStore } from '@/stores/agent'
 import { useHealthStore } from '@/stores/health'
@@ -24,10 +25,14 @@ const router = useRouter()
 const drawerOpen = ref(false)
 const composerOpen = ref(false)
 const draft = ref('')
+const user = ref<AuthUser | null>(null)
 
 const isChat = computed(() => route.path.startsWith('/chat'))
 const isPasswordChange = computed(() => route.name === 'change-password')
+const isInvite = computed(() => route.name === 'invite')
+const isAdmin = computed(() => user.value?.role === 'admin')
 const activeNav = computed(() => {
+  if (route.path.startsWith('/admin')) return '/admin'
   if (route.path.startsWith('/settings')) return '/settings'
   if (isChat.value) return '/chat'
   return '/'
@@ -39,6 +44,18 @@ const healthTip = computed(() => {
   if (h.status === 'connected') return h.modelConfigured ? '后端正常 · 模型已配置' : '后端正常 · 模型未配置'
   return '正在检查后端…'
 })
+
+async function refreshUser(): Promise<void> {
+  user.value = await cachedUser()
+}
+
+watch(
+  () => route.fullPath,
+  () => {
+    void refreshUser()
+  },
+)
+
 
 /** 打开「新建对话」弹窗。**不直接 newChat**：先让人决定第一句说什么，再开始。 */
 function openComposer(): void {
@@ -85,18 +102,20 @@ async function signOut(): Promise<void> {
     return
   }
   agent.newChat()
+  user.value = null
   void router.push('/login')
 }
 
 onMounted(() => {
+  void refreshUser()
   // 改密页不恢复业务数据：此刻服务端还没放行，restore() 只会制造一串 403。
-  if (!isPasswordChange.value) void agent.restore()
+  if (!isPasswordChange.value && !isInvite.value) void agent.restore()
   health.start()
 })
 </script>
 
 <template>
-  <RouterView v-if="isPasswordChange" />
+  <RouterView v-if="isPasswordChange || isInvite" />
   <div v-else class="shell">
     <!-- 桌面端：深墨绿图标侧边栏 -->
     <aside class="sidebar">
@@ -110,6 +129,15 @@ onMounted(() => {
         </RouterLink>
         <RouterLink to="/chat" class="nav-item" :class="{ active: activeNav === '/chat' }" title="对话">
           <el-icon><ChatLineSquare /></el-icon>
+        </RouterLink>
+        <RouterLink
+          v-if="isAdmin"
+          to="/admin"
+          class="nav-item"
+          :class="{ active: activeNav === '/admin' }"
+          title="管理"
+        >
+          <el-icon><UserFilled /></el-icon>
         </RouterLink>
         <RouterLink to="/settings" class="nav-item" :class="{ active: activeNav === '/settings' }" title="设置">
           <el-icon><Setting /></el-icon>
@@ -142,6 +170,9 @@ onMounted(() => {
         <el-icon><Menu /></el-icon>
       </button>
       <span class="mobile-title">AgentWorkbench</span>
+      <RouterLink v-if="isAdmin" to="/admin" class="icon-btn" title="管理">
+        <el-icon><UserFilled /></el-icon>
+      </RouterLink>
       <RouterLink to="/settings" class="icon-btn" title="设置">
         <el-icon><Setting /></el-icon>
       </RouterLink>
@@ -172,8 +203,8 @@ onMounted(() => {
       </div>
     </main>
 
-    <!-- 新建对话。**弹窗里只有「第一句」这一件事**：模式切换在对话页顶部，
-         当前后端两种模式走的是同一条路，在这里摆两个选项等于伪造一个选择。 -->
+    <!-- 新建对话。**弹窗里只有「第一句」这一件事**：入口切换在对话页顶部，
+         切换入口本身就会新建会话；在这里再摆一次模式选项会造出第二个真源。 -->
     <el-dialog
       v-model="composerOpen"
       class="new-chat-dialog"

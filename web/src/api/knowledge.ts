@@ -75,11 +75,13 @@ export interface AskResponse {
 export async function askKnowledge(
   question: string,
   conversationId?: string | null,
+  signal?: AbortSignal,
 ): Promise<AskResponse> {
   const response = await fetch('/api/knowledge/ask', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question, conversationId: conversationId || null }),
+    signal,
   })
   // 必须过 handle：fetch 不会因 4xx/5xx 抛错，直接返回 response 的话
   // 一个 500 会被当成"成功响应"往下走，界面显示一条空白答案而不是错误。

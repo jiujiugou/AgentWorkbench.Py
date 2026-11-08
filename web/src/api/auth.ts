@@ -2,7 +2,7 @@
  * 身份 · /api/auth（Cookie 认证）。
  *
  * 契约由后端 `api/routes/identity.py` 定：登录 `POST {email, password}` →
- * `{id, email, role, status, tenantId}`；`GET /me` 未登录是 401。
+ * `{id, email, role, status, tenantId, levelRank}`；`GET /me` 未登录是 401。
  *
  * **这里曾经有一个「这个后端没有身份机制」的占位用户**：`/me` 返回 404 时
  * 伪造一个 `local` 身份放行。它在 F1 落地之前是对的（那时确实没有身份端点），
@@ -19,6 +19,8 @@ export interface AuthUser {
   role: string
   status: string
   tenantId: string
+  /** 账号等级 L1~L5；知识库可见性与上传目标由它决定。 */
+  levelRank: number
   /** 首次登录还没改初始口令：业务接口会 403，界面应直接进改密页。 */
   mustChangePassword: boolean
 }
@@ -92,6 +94,24 @@ export async function login(email: string, password: string): Promise<AuthUser> 
     // 不是「会话过期」，触发全局跳转没有意义（已经在登录页了）。
     throw await toApiError(response)
   }
+  const user = await handle<AuthUser>(response)
+  signedIn = true
+  me = user
+  pending = null
+  return user
+}
+
+export async function acceptInvite(
+  token: string,
+  email: string,
+  password: string,
+): Promise<AuthUser> {
+  const response = await fetch(`/api/auth/invites/${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  })
+  if (!response.ok) throw await toApiError(response)
   const user = await handle<AuthUser>(response)
   signedIn = true
   me = user

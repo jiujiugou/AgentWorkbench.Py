@@ -27,5 +27,10 @@ export default defineConfig({
     // 测试文件不放 src/：`vue-tsc -b` 的 include 只有 src，构建不会把测试
     // 一起类型检查（测试由 vitest 用 esbuild 转译，不需要 tsc）
     reporters: ['default'],
+    // 全量 Python 测试之后，Windows 上一次拉起多个 fork worker 会间歇性
+    // 超时（standalone 能过，CI 顺序下过不了）。单 worker 顺序跑，把这类
+    // 环境噪声从测试结果里去掉。
+    fileParallelism: false,
+    maxWorkers: 1,
   },
 })

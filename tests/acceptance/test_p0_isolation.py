@@ -29,6 +29,7 @@ TENANT_SCOPED = {
     ("GET", "/api/documents/{doc_id}"),
     ("GET", "/api/documents/{doc_id}/pages"),
     ("GET", "/api/documents/{doc_id}/chunks"),
+    ("GET", "/api/documents/{doc_id}/file"),
     ("POST", "/api/documents/{doc_id}/reparse"),
     ("DELETE", "/api/documents/{doc_id}"),
     ("GET", "/api/conversations/{conversation_id}/messages"),
@@ -38,6 +39,11 @@ TENANT_SCOPED = {
     ("PATCH", "/api/members/{user_id}"),
     ("POST", "/api/members/{user_id}/disable"),
     ("POST", "/api/members/{user_id}/enable"),
+    ("POST", "/api/members/{user_id}/reset-password"),
+    ("DELETE", "/api/members/invites/{invite_id}"),
+    ("PATCH", "/api/knowledge-bases/{kb_id}"),
+    ("POST", "/api/knowledge-bases/{kb_id}/archive"),
+    ("POST", "/api/knowledge-bases/{kb_id}/unarchive"),
 }
 """走团队归属的资源路由。**必须逐条列出**，不能从「有路径参数」推。"""
 
@@ -102,6 +108,25 @@ def _conversation_still_exists(teams: TwoTeams, conversation_id: str) -> None:
     assert row is not None, "越权删除把别人的会话删掉了"
 
 
+def _kb_b(teams: TwoTeams) -> str:
+    with closing(teams.open_conn()) as conn:
+        row = conn.execute(
+            "select id from knowledge_bases where tenant_id = ? and is_default = 1",
+            (teams.tenant_b,),
+        ).fetchone()
+    assert row is not None, "团队乙没有默认知识库"
+    return str(row["id"])
+
+
+def _kb_not_archived(teams: TwoTeams, kb_id: str) -> None:
+    with closing(teams.open_conn()) as conn:
+        row = conn.execute(
+            "select archived_at from knowledge_bases where id = ?", (kb_id,)
+        ).fetchone()
+    assert row is not None, "???????"
+    assert row["archived_at"] is None, "????????????"
+
+
 def _member_unchanged(teams: TwoTeams, user_id: str) -> None:
     with closing(teams.open_conn()) as conn:
         row = conn.execute("select role, status from users where id = ?", (user_id,)).fetchone()
@@ -119,6 +144,9 @@ def _cases(teams: TwoTeams) -> dict[str, Case]:
         ),
         "document_chunks": Case(
             "GET", "/api/documents/{doc_id}/chunks", "doc_id", "document", teams.doc_b, "doc"
+        ),
+        "document_download": Case(
+            "GET", "/api/documents/{doc_id}/file", "doc_id", "document", teams.doc_b, "doc"
         ),
         "document_reparse": Case(
             "POST",
@@ -185,6 +213,51 @@ def _cases(teams: TwoTeams) -> dict[str, Case]:
             "user",
             state_unchanged=_member_unchanged,
         ),
+        "member_reset": Case(
+            "POST",
+            "/api/members/{user_id}/reset-password",
+            "user_id",
+            "user",
+            teams.member_b,
+            "user",
+            payload={"password": "a-long-enough-password"},
+            state_unchanged=_member_unchanged,
+        ),
+        "invite_revoke": Case(
+            "DELETE",
+            "/api/members/invites/{invite_id}",
+            "invite_id",
+            "invite",
+            "invite-missing",
+            "i",
+        ),
+        "kb_update": Case(
+            "PATCH",
+            "/api/knowledge-bases/{kb_id}",
+            "kb_id",
+            "knowledge_base",
+            _kb_b(teams),
+            "kb",
+            payload={"name": "renamed"},
+        ),
+        "kb_archive": Case(
+            "POST",
+            "/api/knowledge-bases/{kb_id}/archive",
+            "kb_id",
+            "knowledge_base",
+            _kb_b(teams),
+            "kb",
+            state_unchanged=_kb_not_archived,
+        ),
+        "kb_unarchive": Case(
+            "POST",
+            "/api/knowledge-bases/{kb_id}/unarchive",
+            "kb_id",
+            "knowledge_base",
+            _kb_b(teams),
+            "kb",
+            state_unchanged=_kb_not_archived,
+        ),
     }
 
 
@@ -192,6 +265,7 @@ CASE_NAMES = (
     "document_get",
     "document_pages",
     "document_chunks",
+    "document_download",
     "document_reparse",
     "document_delete",
     "conversation_messages",
@@ -201,6 +275,11 @@ CASE_NAMES = (
     "member_role",
     "member_disable",
     "member_enable",
+    "member_reset",
+    "invite_revoke",
+    "kb_update",
+    "kb_archive",
+    "kb_unarchive",
 )
 
 

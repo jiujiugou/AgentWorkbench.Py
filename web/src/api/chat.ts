@@ -23,11 +23,13 @@ export interface GeneralChatResponse {
 export async function chatGeneral(
   question: string,
   conversationId?: string | null,
+  signal?: AbortSignal,
 ): Promise<GeneralChatResponse> {
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question, conversationId: conversationId || null }),
+    signal,
   })
   return handle<GeneralChatResponse>(response)
 }

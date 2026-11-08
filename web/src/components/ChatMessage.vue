@@ -101,9 +101,11 @@ function onMarkdownClick(e: MouseEvent): void {
 const emptyNote = computed(() => {
   if (props.message.role !== 'assistant' || props.message.pending) return ''
   if (props.refusal || bodyText.value) return ''
+  if (props.stopStatus === 'cancelled') return '已停止生成。'
   const status = props.message.runStatus
   if (status === 'running') return '这一轮还没有结束。进程若已中断，它会一直停在这里。'
-  if (status === 'failed' || status === 'cancelled' || status === 'limited') {
+  if (status === 'cancelled') return '这一轮已停止。'
+  if (status === 'failed' || status === 'limited') {
     return '这一轮没有答上来，展开下面的执行过程看原因。'
   }
   return '这一轮没有留下正文。'

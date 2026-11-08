@@ -107,10 +107,12 @@ def test_upload_flows_to_parsed_with_camel_case_contract(harness: Harness) -> No
         "chunkCount",
         "vectorCount",
         "indexState",
+        "kbId",
     }
     missing = camel - set(body)
     assert not missing, f"响应缺字段（前端会读到 undefined）：{sorted(missing)}"
     assert "file_name" not in body, "snake_case 泄漏到 HTTP 层"
+    assert body["kbId"], "upload must land in a knowledge base"
     assert body["status"] == "pending", "返回时只承诺 pending，不承诺解析完"
 
     doc_id = body["id"]

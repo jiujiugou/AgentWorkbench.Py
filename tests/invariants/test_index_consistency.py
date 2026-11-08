@@ -42,6 +42,7 @@ def conn() -> Iterator[sqlite3.Connection]:
     # 检索的团队条件走它（`search_fts` 的子查询）。这里补列而不是重做二进制库——
     # 这份 fixture 的价值在**索引内容**（幽灵行、错位块那些形态），不在 schema 版本。
     target.execute("alter table documents add column tenant_id text not null default 'default'")
+    target.execute("alter table documents add column kb_id text")
     # vec0 虚表模块必须显式加载——backup 过来的库有 vec 表但没有扩展，
     # 任何碰 vec_chunks_vec 的语句都会报 no such module（[d] 正控测试踩过）。
     engine.load_vec(target)

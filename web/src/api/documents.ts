@@ -26,6 +26,8 @@ export interface DocumentDto {
   vectorCount?: number | null
   /** 索引覆盖度；text_only / partial 表示语义检索覆盖不全。 */
   indexState?: IndexState | string
+  /** 文档所属知识库；可见性由知识库决定，不在这里做二次 ACL。 */
+  kbId?: string | null
 }
 
 export interface DocumentPageDto {
@@ -74,6 +76,7 @@ export async function removeDocument(id: string): Promise<void> {
 export function uploadDocument(
   file: File,
   onProgress: (percent: number) => void,
+  kbId?: string | null,
 ): { promise: Promise<DocumentDto>; abort: () => void } {
   const xhr = new XMLHttpRequest()
   const promise = new Promise<DocumentDto>((resolve, reject) => {
@@ -96,6 +99,7 @@ export function uploadDocument(
     xhr.addEventListener('abort', () => reject(new Error('已取消')))
     const form = new FormData()
     form.append('file', file)
+    if (kbId) form.append('kb_id', kbId)
     xhr.send(form)
   })
   return { promise, abort: () => xhr.abort() }

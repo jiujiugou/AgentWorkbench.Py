@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import type { CitationReport, RefusalInfo, RetrievalSource, RunSummary, ToolStepEvent } from '@/types'
 import { askKnowledge, historyReport, historySources, toReport, toSources } from '@/api/knowledge'
 import { chatGeneral } from '@/api/chat'
+import { cancelRun } from '@/api/runs'
 import {
   conversationsApi,
   toRunSummary,
@@ -44,6 +45,9 @@ export const useAgentStore = defineStore('agent', () => {
   const status = ref<ConnectionStatus>('disconnected')
   const messages = ref<ChatMessage[]>([])
   const generating = ref(false)
+  /** 当前在飞的作答：停止时先收口 run，再掐断这条 fetch，避免迟到响应盖住“已停止”。 */
+  let activeController: AbortController | null = null
+  let activeReplyId: string | null = null
   const conversationId = ref<string | null>(null)
   const conversations = ref<Conversation[]>([])
   const sources = ref<Record<string, RetrievalSource[]>>({})
@@ -508,26 +512,40 @@ export const useAgentStore = defineStore('agent', () => {
     messages.value.push({ id: replyId, role: 'assistant', content: '', pending: true })
     generating.value = true
 
+    const controller = new AbortController()
+    activeController = controller
+    activeReplyId = replyId
+
     try {
       if (method === 'Ask') {
         // 知识库入口：有检索、引用与拒答。
-        const response = await askKnowledge(content, conversationId.value)
+        const response = await askKnowledge(content, conversationId.value, controller.signal)
         applyResponse(replyId, response)
       } else {
         // 通用入口：不检索、不引用，响应明确标识 mode=general。
-        const response = await chatGeneral(content, conversationId.value)
+        const response = await chatGeneral(content, conversationId.value, controller.signal)
         applyGeneralResponse(replyId, response)
       }
       // 新建的会话要出现在侧栏。不刷新的话它只在下次进页面时才出现，
       // 用户会以为"刚才那次对话没保存"（而实际上已经落库了）。
       await refreshConversations()
     } catch (e) {
-      // 记录写不进去（audit_unavailable）走到这里：这次回答不算成功，
-      // 所以界面上不该出现半个答案，只出现错误。
       const message = findOrCreate(replyId)
       message.pending = false
+      if (controller.signal.aborted) {
+        // 停止路径先收口 run，再 abort 这条 fetch；AbortError 不是“回答失败”，
+        // 不能渲染成警告文案。
+        message.content = ''
+        message.runStatus = 'cancelled'
+        stops.value[replyId] = 'cancelled'
+        return
+      }
+      // 记录写不进去（audit_unavailable）走到这里：这次回答不算成功，
+      // 所以界面上不该出现半个答案，只出现错误。
       message.content = '⚠️ ' + (e as Error).message
     } finally {
+      if (activeController === controller) activeController = null
+      if (activeReplyId === replyId) activeReplyId = null
       generating.value = false
     }
   }
@@ -536,11 +554,44 @@ export const useAgentStore = defineStore('agent', () => {
   const ask = (text: string) => dispatch('Ask', text)
 
   async function stop(): Promise<void> {
+    if (!generating.value) return
+
+    let result: Awaited<ReturnType<typeof cancelRun>>
     try {
-      await connection.value?.invoke('Stop')
-    } catch {
-      /* 连接可能已断开 */
+      // Python 后端没有 hub：停止是一条普通 HTTP 请求，把 run 收口成 cancelled。
+      // 新会话首问时 conversationId 还是 null，服务端按“当前用户最新的 running”
+      // 找到它，并在响应里把新会话 id 交回来。
+      result = await cancelRun({ conversationId: conversationId.value })
+    } catch (e) {
+      ElMessage.error(`停止失败：${(e as Error).message}`)
+      return
     }
+
+    // 停止来晚了：run 已经是终态，或模型刚好返回、assistant 步已完整。
+    // 这时不 abort——让正常响应落地，不要用“已停止”覆盖一次已经完成的回答。
+    if (!result.cancelled) return
+
+    if (result.conversationId) {
+      conversationId.value = result.conversationId
+      persistConversationId(result.conversationId)
+    }
+
+    const controller = activeController
+    const replyId = activeReplyId
+    controller?.abort()
+
+    if (replyId) {
+      const message = findOrCreate(replyId)
+      message.pending = false
+      message.content = ''
+      message.runStatus = 'cancelled'
+      stops.value[replyId] = 'cancelled'
+      // 已发出未返回的那一步要能在“执行过程”里看到；runId 由停止响应带回。
+      if (result.runId) void loadTrace(replyId, result.runId)
+    }
+
+    generating.value = false
+    void refreshConversations()
   }
 
   // ---------- 初始化 ----------

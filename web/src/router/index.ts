@@ -8,6 +8,18 @@ const router = createRouter({
     { path: '/chat', name: 'chat', component: () => import('@/views/ChatView.vue') },
     { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
     {
+      path: '/admin',
+      name: 'admin',
+      component: () => import('@/views/AdminView.vue'),
+      meta: { admin: true },
+    },
+    {
+      path: '/invite/:token',
+      name: 'invite',
+      component: () => import('@/views/InviteView.vue'),
+      meta: { public: true },
+    },
+    {
       path: '/change-password',
       name: 'change-password',
       component: () => import('@/views/ChangePasswordView.vue'),
@@ -26,6 +38,7 @@ router.beforeEach(async (to) => {
   if (user.mustChangePassword && to.name !== 'change-password') {
     return { path: '/change-password', query: { redirect: to.fullPath } }
   }
+  if (to.meta.admin === true && user.role !== 'admin') return { path: '/' }
   return true
 })
 

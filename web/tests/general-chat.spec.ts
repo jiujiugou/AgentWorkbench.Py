@@ -19,6 +19,8 @@ vi.mock('@/api/knowledge', () => ({
 
 vi.mock('@/api/chat', () => ({ chatGeneral: vi.fn() }))
 
+vi.mock('@/api/runs', () => ({ cancelRun: vi.fn() }))
+
 vi.mock('@/api/conversations', () => ({
   conversationsApi: {
     list: vi.fn().mockResolvedValue([]),
@@ -36,6 +38,7 @@ vi.mock('@/api/settings', () => ({
 
 import { askKnowledge } from '@/api/knowledge'
 import { chatGeneral } from '@/api/chat'
+import { cancelRun } from '@/api/runs'
 import { useAgentStore } from '@/stores/agent'
 
 beforeEach(() => {
@@ -63,5 +66,41 @@ describe('知识库拒答', () => {
     const reply = store.messages.find((message) => message.role === 'assistant')
     expect(reply).toBeDefined()
     expect(store.refusals[String(reply?.id)].text).toBe('资料不足以回答该问题。')
+  })
+})
+
+describe('停止', () => {
+  it('test_stop_cancels_the_python_run_and_marks_the_message_stopped', async () => {
+    vi.mocked(cancelRun).mockResolvedValue({
+      runId: 'r2',
+      conversationId: 'c1',
+      status: 'cancelled',
+      cancelled: true,
+    })
+    let aborted = false
+    vi.mocked(chatGeneral).mockImplementation(
+      (_question, _conversationId, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            aborted = true
+            const error = new Error('aborted')
+            error.name = 'AbortError'
+            reject(error)
+          })
+        }),
+    )
+    const store = useAgentStore()
+
+    const pending = store.send('用一个不存在的企业资料回答')
+    await store.stop()
+    await pending
+
+    expect(cancelRun).toHaveBeenCalledWith({ conversationId: null })
+    expect(aborted).toBe(true)
+    expect(store.conversationId).toBe('c1')
+    expect(store.generating).toBe(false)
+    const reply = store.messages.find((message) => message.role === 'assistant')
+    expect(reply?.runStatus).toBe('cancelled')
+    expect(store.stops[String(reply?.id)]).toBe('cancelled')
   })
 })

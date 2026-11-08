@@ -161,7 +161,15 @@ def test_login_sets_an_httponly_lax_cookie_and_keeps_the_token_out_of_the_body(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"id", "email", "role", "status", "tenantId", "mustChangePassword"}
+    assert set(body) == {
+        "id",
+        "email",
+        "role",
+        "status",
+        "tenantId",
+        "levelRank",
+        "mustChangePassword",
+    }
     assert body["email"] == ADMIN_EMAIL
     assert body["role"] == "admin"
     assert body["mustChangePassword"] is False
@@ -247,7 +255,15 @@ def test_me_round_trips_the_account(client: TestClient, app: FastAPI) -> None:
 
     body = client.get("/api/auth/me").json()
 
-    assert set(body) == {"id", "email", "role", "status", "tenantId", "mustChangePassword"}
+    assert set(body) == {
+        "id",
+        "email",
+        "role",
+        "status",
+        "tenantId",
+        "levelRank",
+        "mustChangePassword",
+    }
     assert body["status"] == "active"
     assert body["mustChangePassword"] is False
 

@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 
 from agentworkbench.api.app import create_app
 from agentworkbench.api.deps import Deps, build_deps
+from agentworkbench.api.routes import runs as runs_routes
 from agentworkbench.config import Settings
 from agentworkbench.core.documents import ChunkDraft
 from agentworkbench.db import engine
@@ -327,3 +328,117 @@ def test_saved_answer_is_readable_through_the_run(h: Harness) -> None:
     assert status["answer"] == answer_row["content"]
     assert status["conversationId"] == conversation_id
     assert answer_row["runId"] == run_id
+
+
+# ── REQ-16：停止 ──
+
+
+def _running_threads() -> set[threading.Thread]:
+    with runs_routes._threads_lock:
+        return set(runs_routes._threads)
+
+
+def test_cancel_closes_the_inflight_run_and_keeps_the_unanswered_step(h: Harness) -> None:
+    """模型调用阻塞中发停止：终态 cancelled，且“已发出未返回”的那一步还在。
+
+    停止不能等模型返回——它要做的是把 run 收口；迟到的结果由 close_step 丢弃。
+    """
+    blocking = BlockingChat()
+    h.use_chat(blocking)
+    before = _running_threads()
+
+    submitted = h.client.post("/api/runs", json={"question": QUESTION})
+    conversation_id = submitted.json()["conversationId"]
+    h.wait_until(lambda: h.run_id_of(conversation_id) is not None, what="占位行出现")
+    run_id = h.run_id_of(conversation_id)
+    assert run_id is not None
+    worker = next(iter(_running_threads() - before))
+    h.wait_until(lambda: blocking.entered.is_set(), what="模型调用已发出")
+
+    stopped = h.client.post("/api/runs/cancel", json={"runId": run_id})
+
+    assert stopped.status_code == 200
+    body = stopped.json()
+    assert body["cancelled"] is True
+    assert body["status"] == "cancelled"
+    assert body["runId"] == run_id
+    assert body["conversationId"] == conversation_id
+
+    trace = h.client.get(f"/api/runs/{run_id}/trace").json()
+    assert trace["status"] == "cancelled"
+    assistant = next(step for step in trace["steps"] if step["kind"] == "assistant")
+    assert assistant["output"] is None
+    assert assistant["inFlight"] is True
+
+    blocking.release.set()
+    h.wait_until(lambda: not worker.is_alive(), what="后台线程退出")
+
+    after = h.client.get(f"/api/runs/{run_id}/trace").json()
+    assert after["status"] == "cancelled", "迟到的模型结果不许把终态改成 succeeded"
+    assistant = next(step for step in after["steps"] if step["kind"] == "assistant")
+    assert assistant["output"] is None, "取消后迟到的步骤结果必须被丢弃"
+
+
+def test_cancel_without_run_id_targets_the_active_run(h: Harness) -> None:
+    """前端不知道 runId 也能停：按当前会话 / 当前用户最新的 running 找到它。"""
+    blocking = BlockingChat()
+    h.use_chat(blocking)
+    before = _running_threads()
+
+    submitted = h.client.post("/api/runs", json={"question": QUESTION})
+    conversation_id = submitted.json()["conversationId"]
+    h.wait_until(lambda: h.run_id_of(conversation_id) is not None, what="占位行出现")
+    run_id = h.run_id_of(conversation_id)
+    assert run_id is not None
+    worker = next(iter(_running_threads() - before))
+    h.wait_until(lambda: blocking.entered.is_set(), what="模型调用已发出")
+
+    stopped = h.client.post("/api/runs/cancel", json={"conversationId": conversation_id})
+
+    assert stopped.status_code == 200
+    body = stopped.json()
+    assert body["cancelled"] is True
+    assert body["runId"] == run_id
+    assert body["conversationId"] == conversation_id
+
+    blocking.release.set()
+    h.wait_until(lambda: not worker.is_alive(), what="后台线程退出")
+
+
+def test_cancel_after_terminal_does_not_rewrite_the_run(h: Harness) -> None:
+    """已经成功的 run 不会被“停止”改写成 cancelled，正文也不会被清掉。"""
+    h.use_chat(PlainChat())
+
+    inline = h.client.post("/api/knowledge/ask", json={"question": QUESTION})
+    assert inline.status_code == 200
+    run_id = inline.json()["runId"]
+    answer = inline.json()["answer"]
+
+    stopped = h.client.post("/api/runs/cancel", json={"runId": run_id})
+
+    assert stopped.status_code == 200
+    body = stopped.json()
+    assert body["cancelled"] is False
+    assert body["status"] == "succeeded"
+    assert h.client.get(f"/api/runs/{run_id}").json()["status"] == "succeeded"
+    assert h.client.get(f"/api/runs/{run_id}").json()["answer"] == answer
+
+
+def test_cancelling_a_foreign_run_is_404_like_missing(h: Harness) -> None:
+    """别人的 run 与不存在的 run：剥掉 request_id 后逐字段相同（C-V1 同款判据）。"""
+    conn = h.open_direct()
+    try:
+        conn.execute(
+            "insert into agent_runs (id, user_id, tenant_id, question, status, started_at)"
+            " values ('run-foreign', 'someone-else', 'default', 'q', 'running', 't')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    theirs = h.client.post("/api/runs/cancel", json={"runId": "run-foreign"})
+    nobody = h.client.post("/api/runs/cancel", json={"runId": "never-existed"})
+
+    assert theirs.status_code == nobody.status_code == 404
+    assert _without_request_id(theirs) == _without_request_id(nobody)
+    assert b"run-foreign" not in theirs.content, "id 回显就是在告诉攻击者这条存在"

@@ -13,23 +13,40 @@ const router = useRouter()
 const input = ref('')
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
 const listRef = ref<HTMLElement | null>(null)
-const knowledgeMode = ref(false)
 const atBottom = ref(true)
 
 const hasModels = computed(() => agent.modelOptions.length > 0)
 const providersWithModels = computed(() => agent.providers.filter((p) => p.models.length > 0))
 
-/** 当前会话的类型。切换入口 = 新建会话，不能在同一条历史里换合同。 */
+const activeConversation = computed(() =>
+  agent.conversations.find((c) => c.id === agent.conversationId),
+)
+
+/**
+ * 当前入口。有会话时以会话的 `kind` 为准——刷新、路由切回、重开页面都不能
+ * 让知识库会话被显示成通用入口；没有会话时，才是用户为下一条新会话选的入口。
+ * 产品默认入口是知识库问答。
+ */
+const knowledgeMode = ref(activeConversation.value?.kind !== 'general')
+
 watch(
-  () => agent.conversationId,
-  (id) => {
-    const conversation = agent.conversations.find((c) => c.id === id)
-    if (conversation) knowledgeMode.value = conversation.kind === 'knowledge'
+  () => activeConversation.value?.kind,
+  (kind) => {
+    if (kind) knowledgeMode.value = kind === 'knowledge'
   },
+  { immediate: true },
+)
+
+/**
+ * 真正决定这一条消息发往哪个入口的值。当前会话存在时永远跟着会话类型，
+ * 不跟顶部开关走：开关只负责“下一条新会话”，不能让旧会话的答案合同漂移。
+ */
+const sendToKnowledge = computed(() =>
+  activeConversation.value ? activeConversation.value.kind === 'knowledge' : knowledgeMode.value,
 )
 
 function setMode(knowledge: boolean): void {
-  if (knowledgeMode.value === knowledge) return
+  if (sendToKnowledge.value === knowledge) return
   if (agent.generating) {
     ElMessage.warning('生成中，请先停止或等待完成')
     return
@@ -82,7 +99,7 @@ async function handleSend(text?: string): Promise<void> {
   input.value = ''
   void nextTick(autoResize)
   atBottom.value = true
-  await (knowledgeMode.value ? agent.ask(content) : agent.send(content))
+  await (sendToKnowledge.value ? agent.ask(content) : agent.send(content))
 }
 
 function onKeydown(e: KeyboardEvent): void {
@@ -137,7 +154,7 @@ onMounted(() => {
 
       <div class="chat-actions">
         <div class="mode-toggle">
-          <button :class="{ on: !knowledgeMode }" @click="setMode(false)">对话</button>
+          <button :class="{ on: !knowledgeMode }" @click="setMode(false)">通用对话</button>
           <button :class="{ on: knowledgeMode }" @click="setMode(true)">知识库问答</button>
         </div>
 
@@ -178,7 +195,7 @@ onMounted(() => {
             <el-icon><MagicStick /></el-icon>
           </div>
           <h2>有什么可以帮忙的？</h2>
-          <p>「对话」直接聊天；「知识库问答」会在需要时检索知识库并给出引用来源。</p>
+          <p>「知识库问答」会在需要时检索知识库并给出引用来源；「通用对话」直接聊天并明确标注未使用企业资料。</p>
           <div class="suggestions">
             <button v-for="s in QUICK_STARTS" :key="s" class="suggestion" @click="handleSend(s)">
               {{ s }}

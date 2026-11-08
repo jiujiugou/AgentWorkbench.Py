@@ -144,7 +144,7 @@ def test_unique_index_is_what_actually_dedupes(env: Env) -> None:
         repo.create(env.conn, doc_id="doc-2", **kwargs)  # type: ignore[arg-type]
     env.conn.rollback()
 
-    env.conn.execute("drop index ux_documents_tenant_sha256")
+    env.conn.execute("drop index ux_documents_tenant_kb_sha256")
     repo.create(env.conn, doc_id="doc-2", **kwargs)  # type: ignore[arg-type]
     env.conn.commit()
     assert env.conn.execute("select count(*) from documents").fetchone()[0] == 2
