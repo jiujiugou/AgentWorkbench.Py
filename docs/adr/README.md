@@ -94,3 +94,4 @@ ADR 与设计文档会写同一件事——这是**有意的**，但必须指定
 | [0016](0016-agent-runtime-boundary-and-deliberate-omissions.md) | Agent 运行时五条不变量（可停/可拦/可回放/可恢复/不自作主张）；C# 运行时主体已在，补 7 项、主动放弃 18 项能力，首批只 5 条判据 | Accepted（未实施） | 运行时 |
 | [0017](0017-agnostic-core-ports-and-adapters.md) | 底座五层业务无关：逐层词汇边界、三个注入口、工具层劈两半；换域不改动底座（AC-01）与禁词扫描（AC-02） | Accepted（未实施） | 跨仓库 |
 | [0018](0018-standard-mechanisms-must-use-framework.md) | 标准机制一律用框架，自研只许在业务语义层；把 11-04「有没有标准形态」从包提升到机制、从 Python 仓扩到双仓；逐项裁决 A/B/C 三档 | Accepted（未实施） | 跨仓库 |
+| [0019](0019-timeout-is-unknown-not-failure.md) | 外部动作超时归「不知道」而非「失败」，触发只读查证不重放；这类机制不靠人工造故障验收 | Accepted | 运行时 / 跨仓库 |
